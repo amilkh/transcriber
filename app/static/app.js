@@ -15,6 +15,12 @@ let workletNode;
 let isRunning = false;
 let partialEl = null;
 let lastFinalText = "";
+let autoLockedLang = "";
+let autoLockUntil = 0;
+let autoOppositeStreak = 0;
+
+const AUTO_LOCK_MS = 12000;
+const AUTO_SWITCH_STREAK = 2;
 
 // ---------------------------------------------------------------------------
 // Transcript rendering
@@ -54,6 +60,9 @@ function updatePartial(text) {
 function addFinalEntry(text, detectedLang) {
   if (!text || text === lastFinalText) return;
   const selectedLang = languageSelect.value;
+  if (selectedLang === "auto") {
+    updateAutoLanguageLock(text, detectedLang);
+  }
   if (shouldSuppressFinal(text, detectedLang, selectedLang)) return;
   lastFinalText = text;
   clearPartial();
@@ -107,10 +116,77 @@ function looksEnglish(text) {
   return /[A-Za-z]/.test(text) && !looksJapanese(text);
 }
 
+function inferLanguage(text, detectedLang) {
+  if (detectedLang === "ja" || detectedLang === "en") return detectedLang;
+  if (looksJapanese(text)) return "ja";
+  if (looksEnglish(text)) return "en";
+  return "";
+}
+
+function languageLabel(lang) {
+  return lang === "ja" ? "Japanese" : "English";
+}
+
+function resetAutoLanguageLock() {
+  autoLockedLang = "";
+  autoLockUntil = 0;
+  autoOppositeStreak = 0;
+}
+
+function pushLanguageConfig(lang) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "config", language: lang }));
+  }
+}
+
+function lockAutoLanguage(nextLang, announce) {
+  autoLockedLang = nextLang;
+  autoLockUntil = Date.now() + AUTO_LOCK_MS;
+  autoOppositeStreak = 0;
+  pushLanguageConfig(nextLang);
+  if (announce) {
+    addStatusLine(`[status] Auto locked to ${languageLabel(nextLang)}`);
+  }
+}
+
+function updateAutoLanguageLock(text, detectedLang) {
+  const inferred = inferLanguage(text, detectedLang);
+  if (!inferred) return;
+
+  if (!autoLockedLang || Date.now() > autoLockUntil) {
+    lockAutoLanguage(inferred, true);
+    return;
+  }
+
+  if (inferred === autoLockedLang) {
+    autoLockUntil = Date.now() + AUTO_LOCK_MS;
+    autoOppositeStreak = 0;
+    return;
+  }
+
+  autoOppositeStreak += 1;
+  if (autoOppositeStreak >= AUTO_SWITCH_STREAK) {
+    lockAutoLanguage(inferred, true);
+  }
+}
+
+function shouldSuppressPartial(text, detectedLang, selectedLang) {
+  if (selectedLang === "ja") return detectedLang === "en" || looksEnglish(text);
+  if (selectedLang === "en") return detectedLang === "ja" || looksJapanese(text);
+  if (selectedLang !== "auto") return false;
+  if (!autoLockedLang) return false;
+  const inferred = inferLanguage(text, detectedLang);
+  return inferred && inferred !== autoLockedLang;
+}
+
 function shouldSuppressFinal(text, detectedLang, selectedLang) {
   // If user selected Japanese, hide English-only hypotheses from bilingual auto behavior.
-  if (selectedLang !== "ja") return false;
-  return detectedLang === "en" || looksEnglish(text);
+  if (selectedLang === "ja") return detectedLang === "en" || looksEnglish(text);
+  if (selectedLang === "en") return detectedLang === "ja" || looksJapanese(text);
+  if (selectedLang !== "auto") return false;
+  if (!autoLockedLang) return false;
+  const inferred = inferLanguage(text, detectedLang);
+  return inferred && inferred !== autoLockedLang;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +224,9 @@ async function connectSocket() {
     try {
       const msg = JSON.parse(event.data);
       if (msg.type === "partial") {
-        updatePartial(msg.text || "");
+        if (!shouldSuppressPartial(msg.text || "", msg.lang || "", languageSelect.value)) {
+          updatePartial(msg.text || "");
+        }
       } else if (msg.type === "final") {
         addFinalEntry(msg.text || "", msg.lang || "");
       } else if (msg.type === "status") {
@@ -163,13 +241,17 @@ async function connectSocket() {
     }
   };
 
-  ws.send(JSON.stringify({ type: "config", language: languageSelect.value }));
+  if (languageSelect.value === "auto") {
+    resetAutoLanguageLock();
+  }
+  pushLanguageConfig(languageSelect.value);
   setConnected(true);
 }
 
 async function startMic() {
   partialEl = null;
   lastFinalText = "";
+  resetAutoLanguageLock();
   await connectSocket();
 
   mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -199,6 +281,7 @@ async function startMic() {
 
 function stopMic() {
   isRunning = false;
+  resetAutoLanguageLock();
   clearPartial();
   workletNode?.disconnect(); workletNode = null;
   sourceNode?.disconnect();  sourceNode = null;
@@ -224,8 +307,11 @@ micButton.addEventListener("click", async () => {
 });
 
 languageSelect.addEventListener("change", () => {
+  if (languageSelect.value === "auto") {
+    resetAutoLanguageLock();
+  }
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: "config", language: languageSelect.value }));
+    pushLanguageConfig(languageSelect.value);
   }
 });
 
