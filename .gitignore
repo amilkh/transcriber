@@ -4,3 +4,4 @@ __pycache__/
 .env
 context/*
 !context/.gitkeep
+docs/email_takemoto_okamoto.md
