@@ -5,3 +5,4 @@ __pycache__/
 context/*
 !context/.gitkeep
 docs/email_*.md
+docs/email_context_dump.md
