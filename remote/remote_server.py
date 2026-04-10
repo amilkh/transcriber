@@ -3,7 +3,10 @@ import json
 import logging
 import os
 from contextlib import suppress
+from threading import Lock
+from typing import Optional
 
+import ctranslate2
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from faster_whisper import WhisperModel
@@ -11,28 +14,129 @@ from faster_whisper import WhisperModel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("remote-transcriber")
 
-MODEL_SIZE = os.getenv("WHISPER_MODEL", "small")
-DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
-COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE", "int8")
-MIN_SAMPLES = int(os.getenv("MIN_SAMPLES", str(16000 * 2)))
-WINDOW_SAMPLES = int(os.getenv("WINDOW_SAMPLES", str(16000 * 8)))
+MODEL_SIZE = os.getenv("WHISPER_MODEL", "large-v3")
+DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
+COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE", "float16")
+MIN_SAMPLES = int(os.getenv("MIN_SAMPLES", str(16000)))
+WINDOW_SAMPLES = int(os.getenv("WINDOW_SAMPLES", str(16000 * 6)))
+TRANSCRIBE_INTERVAL = float(os.getenv("TRANSCRIBE_INTERVAL", "0.6"))
+VAD_FILTER = os.getenv("VAD_FILTER", "false").lower() == "true"
+ENGINE = os.getenv("STT_ENGINE", "auto").lower()
+VOSK_SCRIPT = os.getenv("VOSK_STREAM_SCRIPT", os.path.expanduser("~/voice/remote_stream_stt.py"))
 
 app = FastAPI(title="Remote Whisper Server")
-model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
+
+
+def resolve_engine() -> str:
+    if ENGINE in {"vosk", "whisper"}:
+        return ENGINE
+    if os.path.isfile(VOSK_SCRIPT):
+        return "vosk"
+    return "whisper"
+
+
+ACTIVE_ENGINE = resolve_engine()
+
+
+def resolve_runtime() -> tuple[str, str]:
+    # Use GPU-first defaults, but avoid hard failure if CUDA is missing.
+    device = DEVICE
+    compute = COMPUTE_TYPE
+    if device == "cuda":
+        try:
+            if ctranslate2.get_cuda_device_count() == 0:
+                logger.warning("CUDA requested but not available; falling back to CPU int8")
+                return "cpu", "int8"
+        except Exception:
+            logger.warning("Could not detect CUDA devices; falling back to CPU int8")
+            return "cpu", "int8"
+    return device, compute
+
+
+RUNTIME_DEVICE, RUNTIME_COMPUTE = resolve_runtime()
+model: WhisperModel | None = None
+model_lock = Lock()
+
+
+def _run_warmup(test_model: WhisperModel) -> None:
+    # Run a tiny inference to catch missing CUDA runtime libs early.
+    warmup_audio = np.zeros(16000, dtype=np.float32)
+    segments, _ = test_model.transcribe(
+        warmup_audio,
+        language="en",
+        beam_size=1,
+        best_of=1,
+        vad_filter=False,
+        condition_on_previous_text=False,
+        without_timestamps=True,
+        temperature=0.0,
+    )
+    # Force eager execution to surface backend errors now.
+    _ = list(segments)
+
+
+def _load_model(device: str, compute_type: str) -> WhisperModel:
+    loaded = WhisperModel(MODEL_SIZE, device=device, compute_type=compute_type)
+    _run_warmup(loaded)
+    return loaded
+
+
+def _is_cuda_runtime_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    needles = ["libcublas", "libcudnn", "cuda", "cublas", "cannot be loaded"]
+    return any(n in msg for n in needles)
+
+
+def ensure_model() -> None:
+    global model, RUNTIME_DEVICE, RUNTIME_COMPUTE
+    with model_lock:
+        if model is not None:
+            return
+        try:
+            model = _load_model(RUNTIME_DEVICE, RUNTIME_COMPUTE)
+        except Exception as exc:
+            if RUNTIME_DEVICE == "cuda" and _is_cuda_runtime_error(exc):
+                logger.warning("CUDA runtime unavailable, falling back to CPU int8: %s", exc)
+                RUNTIME_DEVICE, RUNTIME_COMPUTE = "cpu", "int8"
+                model = _load_model(RUNTIME_DEVICE, RUNTIME_COMPUTE)
+            else:
+                raise
+
+
+def force_cpu_fallback() -> None:
+    global model, RUNTIME_DEVICE, RUNTIME_COMPUTE
+    with model_lock:
+        RUNTIME_DEVICE, RUNTIME_COMPUTE = "cpu", "int8"
+        model = _load_model(RUNTIME_DEVICE, RUNTIME_COMPUTE)
+
+
+if ACTIVE_ENGINE == "whisper":
+    ensure_model()
 
 
 @app.get("/health")
 async def health() -> dict:
-    return {
+    payload = {
         "ok": True,
+        "engine": ACTIVE_ENGINE,
         "model": MODEL_SIZE,
-        "device": DEVICE,
-        "compute_type": COMPUTE_TYPE,
+        "device": RUNTIME_DEVICE,
+        "compute_type": RUNTIME_COMPUTE,
     }
+    if ACTIVE_ENGINE == "vosk":
+        payload["vosk_script"] = VOSK_SCRIPT
+    return payload
 
 
 @app.websocket("/ws")
 async def ws_transcribe(ws: WebSocket) -> None:
+    if ACTIVE_ENGINE == "vosk":
+        await ws_transcribe_vosk(ws)
+        return
+    await ws_transcribe_whisper(ws)
+
+
+async def ws_transcribe_whisper(ws: WebSocket) -> None:
     await ws.accept()
     pcm = bytearray()
     language = "auto"
@@ -42,7 +146,7 @@ async def ws_transcribe(ws: WebSocket) -> None:
     async def transcribe_loop() -> None:
         nonlocal last_sent
         while not stop_event.is_set():
-            await asyncio.sleep(0.9)
+            await asyncio.sleep(TRANSCRIBE_INTERVAL)
 
             sample_count = len(pcm) // 2
             if sample_count < MIN_SAMPLES:
@@ -54,16 +158,42 @@ async def ws_transcribe(ws: WebSocket) -> None:
 
             lang_arg = None if language == "auto" else language
 
-            segments, info = model.transcribe(
-                audio,
-                language=lang_arg,
-                beam_size=1,
-                best_of=1,
-                vad_filter=True,
-                condition_on_previous_text=False,
-                without_timestamps=True,
-                temperature=0.0,
-            )
+            try:
+                segments, info = model.transcribe(
+                    audio,
+                    language=lang_arg,
+                    beam_size=1,
+                    best_of=1,
+                    vad_filter=VAD_FILTER,
+                    condition_on_previous_text=False,
+                    without_timestamps=True,
+                    temperature=0.0,
+                )
+            except Exception as exc:
+                if RUNTIME_DEVICE == "cuda" and _is_cuda_runtime_error(exc):
+                    try:
+                        force_cpu_fallback()
+                        await ws.send_text(
+                            json.dumps(
+                                {
+                                    "type": "status",
+                                    "message": "CUDA libs missing, switched to CPU int8",
+                                }
+                            )
+                        )
+                        continue
+                    except Exception:
+                        logger.exception("CPU fallback failed")
+                logger.exception("Transcription failed")
+                await ws.send_text(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "message": f"Transcription error: {exc}",
+                        }
+                    )
+                )
+                continue
 
             text = " ".join(seg.text.strip() for seg in segments).strip()
             if text and text != last_sent:
@@ -79,6 +209,17 @@ async def ws_transcribe(ws: WebSocket) -> None:
                 )
 
     task = asyncio.create_task(transcribe_loop())
+    await ws.send_text(
+        json.dumps(
+            {
+                "type": "status",
+                "message": (
+                    f"Remote ready ({MODEL_SIZE}, {RUNTIME_DEVICE}/{RUNTIME_COMPUTE}, "
+                    f"vad_filter={VAD_FILTER})"
+                ),
+            }
+        )
+    )
 
     try:
         while True:
@@ -94,6 +235,14 @@ async def ws_transcribe(ws: WebSocket) -> None:
                 if ptype == "config":
                     selected = payload.get("language", "auto")
                     language = selected if selected in {"auto", "en", "ja"} else "auto"
+                    await ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "status",
+                                "message": f"Language set to {language}",
+                            }
+                        )
+                    )
                 elif ptype == "stop":
                     break
             elif msg.get("type") == "websocket.disconnect":
@@ -107,5 +256,152 @@ async def ws_transcribe(ws: WebSocket) -> None:
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+        with suppress(Exception):
+            await ws.close()
+
+
+async def ws_transcribe_vosk(ws: WebSocket) -> None:
+    await ws.accept()
+    language = "auto"
+    proc: Optional[asyncio.subprocess.Process] = None
+    reader_task: Optional[asyncio.Task] = None
+
+    async def start_proc(lang: str) -> tuple[asyncio.subprocess.Process, asyncio.Task]:
+        if not os.path.isfile(VOSK_SCRIPT):
+            raise FileNotFoundError(f"Vosk stream script not found: {VOSK_SCRIPT}")
+
+        cmd = [
+            "python3",
+            VOSK_SCRIPT,
+            "--sample-rate",
+            "16000",
+            "--language",
+            lang,
+        ]
+        p = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        async def read_stdout() -> None:
+            assert p.stdout is not None
+            while True:
+                line = await p.stdout.readline()
+                if not line:
+                    break
+                raw = line.decode("utf-8", errors="replace").strip()
+                if not raw:
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    await ws.send_text(json.dumps({"type": "error", "message": raw}))
+                    continue
+
+                ptype = payload.get("type")
+                if ptype == "result":
+                    await ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "final",
+                                "text": payload.get("text", ""),
+                                "lang": payload.get("language", lang),
+                            }
+                        )
+                    )
+                elif ptype == "partial":
+                    await ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "partial",
+                                "text": payload.get("text", ""),
+                                "lang": payload.get("language", lang),
+                            }
+                        )
+                    )
+                else:
+                    await ws.send_text(json.dumps(payload))
+
+        return p, asyncio.create_task(read_stdout())
+
+    async def stop_proc() -> None:
+        nonlocal proc, reader_task
+        if proc is None:
+            return
+
+        if proc.stdin is not None:
+            with suppress(Exception):
+                proc.stdin.close()
+
+        with suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=1.5)
+        if proc.returncode is None:
+            with suppress(Exception):
+                proc.terminate()
+            with suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=1.5)
+        if proc.returncode is None:
+            with suppress(Exception):
+                proc.kill()
+
+        if reader_task is not None:
+            reader_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await reader_task
+
+        proc = None
+        reader_task = None
+
+    try:
+        proc, reader_task = await start_proc(language)
+        await ws.send_text(
+            json.dumps(
+                {
+                    "type": "status",
+                    "message": f"Remote ready (vosk, language={language})",
+                }
+            )
+        )
+
+        while True:
+            msg = await ws.receive()
+            if "bytes" in msg and msg["bytes"] is not None:
+                if proc is None or proc.stdin is None:
+                    await ws.send_text(json.dumps({"type": "error", "message": "Vosk process not running"}))
+                    continue
+                proc.stdin.write(msg["bytes"])
+                await proc.stdin.drain()
+            elif "text" in msg and msg["text"] is not None:
+                payload = json.loads(msg["text"])
+                ptype = payload.get("type")
+                if ptype == "config":
+                    selected = payload.get("language", "auto")
+                    selected = selected if selected in {"auto", "en", "ja"} else "auto"
+                    if selected != language:
+                        language = selected
+                        await stop_proc()
+                        proc, reader_task = await start_proc(language)
+                    await ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "status",
+                                "message": f"Language set to {language}",
+                            }
+                        )
+                    )
+                elif ptype == "stop":
+                    break
+            elif msg.get("type") == "websocket.disconnect":
+                break
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.exception("Vosk websocket session failed")
+        with suppress(Exception):
+            await ws.send_text(json.dumps({"type": "error", "message": f"Vosk error: {exc}"}))
+    finally:
+        await stop_proc()
         with suppress(Exception):
             await ws.close()

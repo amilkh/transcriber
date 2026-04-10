@@ -3,34 +3,57 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Live EN/JA Transcriber</title>
+    <title>竹本研究室 — Seminar Assistant</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <main class="shell">
-      <section class="card">
-        <h1>Live Transcriber</h1>
-        <p class="sub">Microphone on this machine, transcription on takelab over SSH tunnel.</p>
-
+    <div class="layout">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-ja">竹本研究室</span>
+          <span class="brand-en">Seminar Assistant</span>
+        </div>
         <div class="controls">
-          <label for="language">Language</label>
-          <select id="language">
-            <option value="auto">Auto Detect</option>
+          <select id="language" title="Transcription language">
+            <option value="auto">Auto</option>
+            <option value="ja">日本語</option>
             <option value="en">English</option>
-            <option value="ja">Japanese</option>
           </select>
-
-          <button id="micButton" class="mic-off" type="button">Start Mic</button>
+          <button id="micButton" class="btn btn-mic mic-off" type="button">Start Mic</button>
+          <span id="connection" class="badge badge-off">Disconnected</span>
+          <span id="recording" class="badge badge-off">Mic Off</span>
         </div>
+      </header>
 
-        <div class="status-row">
-          <span id="connection">Disconnected</span>
-          <span id="recording">Mic Off</span>
-        </div>
+      <div class="panels">
+        <!-- Left: live transcript -->
+        <section class="panel panel-transcript">
+          <div class="panel-header">
+            <h2>Live Transcript</h2>
+            <span class="hint">JA → EN translation via local LLM</span>
+          </div>
+          <div id="transcript" class="transcript" aria-live="polite" aria-label="Live transcript"></div>
+        </section>
 
-        <div id="transcript" class="transcript" aria-live="polite"></div>
-      </section>
-    </main>
+        <!-- Right: RAG Q&A -->
+        <section class="panel panel-qa">
+          <div class="panel-header">
+            <h2>Lab Assistant</h2>
+            <span class="hint">Asks the lab knowledge base</span>
+          </div>
+          <div id="qa-messages" class="qa-messages" aria-live="polite" aria-label="Q&A messages"></div>
+          <div class="qa-input-row">
+            <input
+              id="qa-input"
+              type="text"
+              placeholder="Ask about the lab, research, or today's discussion…"
+              autocomplete="off"
+            />
+            <button id="qa-send" class="btn btn-ask" type="button">Ask</button>
+          </div>
+        </section>
+      </div>
+    </div>
 
     <script src="/static/app.js" type="module"></script>
   </body>
