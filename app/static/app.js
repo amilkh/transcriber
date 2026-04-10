@@ -15,11 +15,11 @@ let workletNode;
 let isRunning = false;
 let partialEl = null;
 let lastFinalText = "";
-let autoLockedLang = "";
-let autoLockUntil = 0;
+let autoPreferredLang = "";
+let autoPreferredUntil = 0;
 let autoOppositeStreak = 0;
 
-const AUTO_LOCK_MS = 12000;
+const AUTO_PREFERRED_MS = 8000;
 const AUTO_SWITCH_STREAK = 2;
 
 // ---------------------------------------------------------------------------
@@ -61,7 +61,7 @@ function addFinalEntry(text, detectedLang) {
   if (!text || text === lastFinalText) return;
   const selectedLang = languageSelect.value;
   if (selectedLang === "auto") {
-    updateAutoLanguageLock(text, detectedLang);
+    updateAutoLanguagePreference(text, detectedLang);
   }
   if (shouldSuppressFinal(text, detectedLang, selectedLang)) return;
   lastFinalText = text;
@@ -128,8 +128,8 @@ function languageLabel(lang) {
 }
 
 function resetAutoLanguageLock() {
-  autoLockedLang = "";
-  autoLockUntil = 0;
+  autoPreferredLang = "";
+  autoPreferredUntil = 0;
   autoOppositeStreak = 0;
 }
 
@@ -139,34 +139,33 @@ function pushLanguageConfig(lang) {
   }
 }
 
-function lockAutoLanguage(nextLang, announce) {
-  autoLockedLang = nextLang;
-  autoLockUntil = Date.now() + AUTO_LOCK_MS;
+function setAutoLanguagePreference(nextLang, announce) {
+  autoPreferredLang = nextLang;
+  autoPreferredUntil = Date.now() + AUTO_PREFERRED_MS;
   autoOppositeStreak = 0;
-  pushLanguageConfig(nextLang);
   if (announce) {
-    addStatusLine(`[status] Auto locked to ${languageLabel(nextLang)}`);
+    addStatusLine(`[status] Auto prefers ${languageLabel(nextLang)}`);
   }
 }
 
-function updateAutoLanguageLock(text, detectedLang) {
+function updateAutoLanguagePreference(text, detectedLang) {
   const inferred = inferLanguage(text, detectedLang);
   if (!inferred) return;
 
-  if (!autoLockedLang || Date.now() > autoLockUntil) {
-    lockAutoLanguage(inferred, true);
+  if (!autoPreferredLang || Date.now() > autoPreferredUntil) {
+    setAutoLanguagePreference(inferred, true);
     return;
   }
 
-  if (inferred === autoLockedLang) {
-    autoLockUntil = Date.now() + AUTO_LOCK_MS;
+  if (inferred === autoPreferredLang) {
+    autoPreferredUntil = Date.now() + AUTO_PREFERRED_MS;
     autoOppositeStreak = 0;
     return;
   }
 
   autoOppositeStreak += 1;
   if (autoOppositeStreak >= AUTO_SWITCH_STREAK) {
-    lockAutoLanguage(inferred, true);
+    setAutoLanguagePreference(inferred, true);
   }
 }
 
@@ -174,19 +173,18 @@ function shouldSuppressPartial(text, detectedLang, selectedLang) {
   if (selectedLang === "ja") return detectedLang === "en" || looksEnglish(text);
   if (selectedLang === "en") return detectedLang === "ja" || looksJapanese(text);
   if (selectedLang !== "auto") return false;
-  if (!autoLockedLang) return false;
+  if (!autoPreferredLang || Date.now() > autoPreferredUntil) return false;
   const inferred = inferLanguage(text, detectedLang);
-  return inferred && inferred !== autoLockedLang;
+  // In auto mode, keep a soft preference only for noisy partials.
+  return inferred && inferred !== autoPreferredLang;
 }
 
 function shouldSuppressFinal(text, detectedLang, selectedLang) {
   // If user selected Japanese, hide English-only hypotheses from bilingual auto behavior.
   if (selectedLang === "ja") return detectedLang === "en" || looksEnglish(text);
   if (selectedLang === "en") return detectedLang === "ja" || looksJapanese(text);
-  if (selectedLang !== "auto") return false;
-  if (!autoLockedLang) return false;
-  const inferred = inferLanguage(text, detectedLang);
-  return inferred && inferred !== autoLockedLang;
+  if (selectedLang === "auto") return false;
+  return false;
 }
 
 // ---------------------------------------------------------------------------
