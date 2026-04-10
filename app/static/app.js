@@ -3,6 +3,9 @@ const transcript = document.getElementById("transcript");
 const languageSelect = document.getElementById("language");
 const connectionBadge = document.getElementById("connection");
 const recordingBadge = document.getElementById("recording");
+const qaMessages = document.getElementById("qa-messages");
+const qaInput = document.getElementById("qa-input");
+const qaSend = document.getElementById("qa-send");
 
 let ws;
 let audioContext;
@@ -10,82 +13,167 @@ let mediaStream;
 let sourceNode;
 let workletNode;
 let isRunning = false;
+let partialEl = null;
+let lastFinalText = "";
 
-function appendLine(text) {
-  const line = document.createElement("div");
-  line.className = "line";
-  line.textContent = text;
-  transcript.appendChild(line);
+// ---------------------------------------------------------------------------
+// Transcript rendering
+// ---------------------------------------------------------------------------
+
+function addStatusLine(text) {
+  const el = document.createElement("div");
+  el.className = "status-line";
+  el.textContent = text;
+  transcript.appendChild(el);
   transcript.scrollTop = transcript.scrollHeight;
 }
 
-function setConnected(connected) {
-  connectionBadge.textContent = connected ? "Connected" : "Disconnected";
+function addErrorLine(text) {
+  const el = document.createElement("div");
+  el.className = "error-line";
+  el.textContent = text;
+  transcript.appendChild(el);
+  transcript.scrollTop = transcript.scrollHeight;
+}
+
+function clearPartial() {
+  if (partialEl) { partialEl.remove(); partialEl = null; }
+}
+
+function updatePartial(text) {
+  if (!text) { clearPartial(); return; }
+  if (!partialEl) {
+    partialEl = document.createElement("div");
+    partialEl.className = "partial";
+    transcript.appendChild(partialEl);
+  }
+  partialEl.textContent = text;
+  transcript.scrollTop = transcript.scrollHeight;
+}
+
+function addFinalEntry(text, detectedLang) {
+  if (!text || text === lastFinalText) return;
+  const selectedLang = languageSelect.value;
+  if (shouldSuppressFinal(text, detectedLang, selectedLang)) return;
+  lastFinalText = text;
+  clearPartial();
+
+  const entry = document.createElement("div");
+  entry.className = "entry";
+
+  const jaEl = document.createElement("div");
+  jaEl.className = "entry-ja";
+  jaEl.textContent = text;
+  entry.appendChild(jaEl);
+
+  transcript.appendChild(entry);
+  transcript.scrollTop = transcript.scrollHeight;
+
+  // In Japanese mode, always show an English line from the translator.
+  // In auto/English mode, only translate when the text appears Japanese.
+  const shouldTranslate = selectedLang === "ja" ||
+    detectedLang === "ja" ||
+    (selectedLang === "auto" && looksJapanese(text));
+  if (!shouldTranslate) return;
+
+  const enEl = document.createElement("div");
+  enEl.className = "entry-en loading";
+  enEl.textContent = "translating…";
+  entry.appendChild(enEl);
+
+  fetch("/api/translate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  })
+    .then((r) => r.json())
+    .then((data) => {
+      const t = data.translation || "";
+      if (t) {
+        enEl.className = "entry-en";
+        enEl.textContent = t;
+      } else {
+        enEl.remove();
+      }
+    })
+    .catch(() => enEl.remove());
+}
+
+function looksJapanese(text) {
+  return /[\u3000-\u9fff\uff00-\uffef]/.test(text);
+}
+
+function looksEnglish(text) {
+  return /[A-Za-z]/.test(text) && !looksJapanese(text);
+}
+
+function shouldSuppressFinal(text, detectedLang, selectedLang) {
+  // If user selected Japanese, hide English-only hypotheses from bilingual auto behavior.
+  if (selectedLang !== "ja") return false;
+  return detectedLang === "en" || looksEnglish(text);
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket connection & mic
+// ---------------------------------------------------------------------------
+
+function setConnected(on) {
+  connectionBadge.textContent = on ? "Connected" : "Disconnected";
+  connectionBadge.className = `badge ${on ? "badge-on" : "badge-off"}`;
 }
 
 function setRecording(on) {
   recordingBadge.textContent = on ? "Mic On" : "Mic Off";
+  recordingBadge.className = `badge ${on ? "badge-on" : "badge-off"}`;
 }
 
 function wsUrl() {
-  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${window.location.host}/ws`;
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${location.host}/ws`;
 }
 
 async function connectSocket() {
-  if (ws && ws.readyState <= 1) {
-    return;
-  }
-
+  if (ws && ws.readyState <= 1) return;
   ws = new WebSocket(wsUrl());
   ws.binaryType = "arraybuffer";
 
-  await new Promise((resolve, reject) => {
-    ws.onopen = resolve;
-    ws.onerror = reject;
-  });
+  await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
 
   ws.onclose = () => {
     setConnected(false);
-    if (isRunning) {
-      appendLine("Connection closed.");
-      stopMic();
-    }
+    if (isRunning) { clearPartial(); addStatusLine("Connection closed."); stopMic(); }
   };
 
   ws.onmessage = (event) => {
     try {
-      const payload = JSON.parse(event.data);
-      if (payload.type === "partial" || payload.type === "final") {
-        appendLine(payload.text);
-      } else if (payload.type === "error") {
-        appendLine(`Error: ${payload.message}`);
+      const msg = JSON.parse(event.data);
+      if (msg.type === "partial") {
+        updatePartial(msg.text || "");
+      } else if (msg.type === "final") {
+        addFinalEntry(msg.text || "", msg.lang || "");
+      } else if (msg.type === "status") {
+        clearPartial();
+        addStatusLine(`[status] ${msg.message}`);
+      } else if (msg.type === "error") {
+        clearPartial();
+        addErrorLine(`Error: ${msg.message}`);
       }
     } catch {
-      appendLine(String(event.data));
+      addStatusLine(String(event.data));
     }
   };
 
-  ws.send(
-    JSON.stringify({
-      type: "config",
-      language: languageSelect.value,
-    })
-  );
-
+  ws.send(JSON.stringify({ type: "config", language: languageSelect.value }));
   setConnected(true);
 }
 
 async function startMic() {
+  partialEl = null;
+  lastFinalText = "";
   await connectSocket();
 
   mediaStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      channelCount: 1,
-      noiseSuppression: true,
-      echoCancellation: true,
-      autoGainControl: true,
-    },
+    audio: { channelCount: 1, noiseSuppression: true, echoCancellation: true, autoGainControl: true },
   });
 
   audioContext = new AudioContext();
@@ -93,17 +181,11 @@ async function startMic() {
 
   sourceNode = audioContext.createMediaStreamSource(mediaStream);
   workletNode = new AudioWorkletNode(audioContext, "pcm-recorder", {
-    processorOptions: {
-      targetSampleRate: 16000,
-      chunkMillis: 200,
-    },
+    processorOptions: { targetSampleRate: 16000, chunkMillis: 200 },
   });
 
-  workletNode.port.onmessage = (event) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      return;
-    }
-    ws.send(event.data);
+  workletNode.port.onmessage = (e) => {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(e.data);
   };
 
   sourceNode.connect(workletNode);
@@ -111,56 +193,84 @@ async function startMic() {
 
   isRunning = true;
   micButton.textContent = "Stop Mic";
-  micButton.classList.remove("mic-off");
-  micButton.classList.add("mic-on");
+  micButton.className = "btn btn-mic mic-on";
   setRecording(true);
 }
 
 function stopMic() {
   isRunning = false;
-
-  if (workletNode) {
-    workletNode.disconnect();
-    workletNode = null;
-  }
-
-  if (sourceNode) {
-    sourceNode.disconnect();
-    sourceNode = null;
-  }
-
-  if (mediaStream) {
-    mediaStream.getTracks().forEach((t) => t.stop());
-    mediaStream = null;
-  }
-
-  if (audioContext) {
-    audioContext.close();
-    audioContext = null;
-  }
-
+  clearPartial();
+  workletNode?.disconnect(); workletNode = null;
+  sourceNode?.disconnect();  sourceNode = null;
+  mediaStream?.getTracks().forEach((t) => t.stop()); mediaStream = null;
+  audioContext?.close(); audioContext = null;
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "stop" }));
     ws.close();
   }
-
   micButton.textContent = "Start Mic";
-  micButton.classList.remove("mic-on");
-  micButton.classList.add("mic-off");
+  micButton.className = "btn btn-mic mic-off";
   setRecording(false);
   setConnected(false);
 }
 
 micButton.addEventListener("click", async () => {
   if (!isRunning) {
-    try {
-      await startMic();
-    } catch (err) {
-      appendLine(`Could not start microphone: ${err}`);
-      stopMic();
-    }
-    return;
+    try { await startMic(); }
+    catch (err) { addErrorLine(`Could not start microphone: ${err}`); stopMic(); }
+  } else {
+    stopMic();
   }
+});
 
-  stopMic();
+languageSelect.addEventListener("change", () => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "config", language: languageSelect.value }));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Q&A panel
+// ---------------------------------------------------------------------------
+
+function addQaMessage(text, role) {
+  const el = document.createElement("div");
+  el.className = `qa-msg ${role}`;
+  el.textContent = text;
+  qaMessages.appendChild(el);
+  qaMessages.scrollTop = qaMessages.scrollHeight;
+  return el;
+}
+
+async function sendQuestion() {
+  const q = qaInput.value.trim();
+  if (!q) return;
+
+  qaInput.value = "";
+  qaSend.disabled = true;
+  addQaMessage(q, "user");
+
+  const loadingEl = addQaMessage("Thinking…", "bot loading");
+
+  try {
+    const resp = await fetch("/api/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: q }),
+    });
+    const data = await resp.json();
+    loadingEl.className = "qa-msg bot";
+    loadingEl.textContent = data.answer || "(no answer)";
+  } catch (err) {
+    loadingEl.className = "qa-msg bot";
+    loadingEl.textContent = `Error: ${err}`;
+  } finally {
+    qaSend.disabled = false;
+    qaInput.focus();
+  }
+}
+
+qaSend.addEventListener("click", sendQuestion);
+qaInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendQuestion(); }
 });
