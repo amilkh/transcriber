@@ -136,26 +136,34 @@ async def ws_transcribe(ws: WebSocket) -> None:
     await ws_transcribe_whisper(ws)
 
 
+SILENCE_RMS_THRESHOLD = float(os.getenv("SILENCE_RMS", "0.008"))  # ~-42 dB
+SILENCE_CHUNKS_FINAL  = int(os.getenv("SILENCE_CHUNKS", "3"))      # 3 × 200 ms = 600 ms
+
+
+def _chunk_rms(data: bytes) -> float:
+    samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+    return float(np.sqrt(np.mean(samples ** 2))) / 32768.0
+
+
 async def ws_transcribe_whisper(ws: WebSocket) -> None:
     await ws.accept()
-    pcm = bytearray()
-    language = "auto"
-    last_sent = ""
-    stop_event = asyncio.Event()
+    pcm          = bytearray()
+    language     = "auto"
+    last_sent    = ""
+    last_lang    = "ja"
+    silent_count = 0   # consecutive silent 200-ms chunks
+    stop_event   = asyncio.Event()
 
     async def transcribe_loop() -> None:
-        nonlocal last_sent
+        nonlocal last_sent, last_lang
         while not stop_event.is_set():
             await asyncio.sleep(TRANSCRIBE_INTERVAL)
-
-            sample_count = len(pcm) // 2
-            if sample_count < MIN_SAMPLES:
+            if len(pcm) // 2 < MIN_SAMPLES:
                 continue
 
             start_byte = max(0, len(pcm) - WINDOW_SAMPLES * 2)
             chunk = bytes(pcm[start_byte:])
             audio = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
-
             lang_arg = None if language == "auto" else language
 
             try:
@@ -173,40 +181,19 @@ async def ws_transcribe_whisper(ws: WebSocket) -> None:
                 if RUNTIME_DEVICE == "cuda" and _is_cuda_runtime_error(exc):
                     try:
                         force_cpu_fallback()
-                        await ws.send_text(
-                            json.dumps(
-                                {
-                                    "type": "status",
-                                    "message": "CUDA libs missing, switched to CPU int8",
-                                }
-                            )
-                        )
+                        await ws.send_text(json.dumps({"type": "status", "message": "CUDA libs missing, switched to CPU int8"}))
                         continue
                     except Exception:
                         logger.exception("CPU fallback failed")
                 logger.exception("Transcription failed")
-                await ws.send_text(
-                    json.dumps(
-                        {
-                            "type": "error",
-                            "message": f"Transcription error: {exc}",
-                        }
-                    )
-                )
+                await ws.send_text(json.dumps({"type": "error", "message": f"Transcription error: {exc}"}))
                 continue
 
             text = " ".join(seg.text.strip() for seg in segments).strip()
             if text and text != last_sent:
                 last_sent = text
-                await ws.send_text(
-                    json.dumps(
-                        {
-                            "type": "partial",
-                            "text": text,
-                            "lang": info.language,
-                        }
-                    )
-                )
+                last_lang = info.language
+                await ws.send_text(json.dumps({"type": "partial", "text": text, "lang": info.language}))
 
     task = asyncio.create_task(transcribe_loop())
     await ws.send_text(
@@ -225,24 +212,30 @@ async def ws_transcribe_whisper(ws: WebSocket) -> None:
         while True:
             msg = await ws.receive()
             if "bytes" in msg and msg["bytes"] is not None:
-                pcm.extend(msg["bytes"])
+                data = msg["bytes"]
+                pcm.extend(data)
                 cap = WINDOW_SAMPLES * 2 * 4
                 if len(pcm) > cap:
                     del pcm[: len(pcm) - cap]
+
+                # Silence detection — emit final when mic goes quiet after speech
+                if _chunk_rms(data) < SILENCE_RMS_THRESHOLD:
+                    silent_count += 1
+                    if silent_count == SILENCE_CHUNKS_FINAL and last_sent:
+                        await ws.send_text(json.dumps({"type": "final", "text": last_sent, "lang": last_lang}))
+                        del pcm[:]
+                        last_sent = ""
+                        silent_count = 0
+                else:
+                    silent_count = 0
+
             elif "text" in msg and msg["text"] is not None:
                 payload = json.loads(msg["text"])
                 ptype = payload.get("type")
                 if ptype == "config":
                     selected = payload.get("language", "auto")
                     language = selected if selected in {"auto", "en", "ja"} else "auto"
-                    await ws.send_text(
-                        json.dumps(
-                            {
-                                "type": "status",
-                                "message": f"Language set to {language}",
-                            }
-                        )
-                    )
+                    await ws.send_text(json.dumps({"type": "status", "message": f"Language set to {language}"}))
                 elif ptype == "stop":
                     break
             elif msg.get("type") == "websocket.disconnect":
@@ -252,6 +245,10 @@ async def ws_transcribe_whisper(ws: WebSocket) -> None:
     except Exception:
         logger.exception("WebSocket session failed")
     finally:
+        # Flush any remaining partial as final
+        if last_sent:
+            with suppress(Exception):
+                await ws.send_text(json.dumps({"type": "final", "text": last_sent, "lang": last_lang}))
         stop_event.set()
         task.cancel()
         with suppress(asyncio.CancelledError):

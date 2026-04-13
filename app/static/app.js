@@ -1,11 +1,13 @@
-const micButton = document.getElementById("micButton");
-const transcript = document.getElementById("transcript");
+const micButton    = document.getElementById("micButton");
+const micDeviceSelect = document.getElementById("micDevice");
+const transcript   = document.getElementById("transcript");
 const languageSelect = document.getElementById("language");
-const connectionBadge = document.getElementById("connection");
-const recordingBadge = document.getElementById("recording");
-const qaMessages = document.getElementById("qa-messages");
-const qaInput = document.getElementById("qa-input");
-const qaSend = document.getElementById("qa-send");
+const qaMessages   = document.getElementById("qa-messages");
+const qaInput      = document.getElementById("qa-input");
+const qaSend       = document.getElementById("qa-send");
+
+// ?view  → read-only viewer (students / professor)
+const isViewer = new URLSearchParams(location.search).has("view");
 
 let ws;
 let audioContext;
@@ -19,8 +21,35 @@ let autoPreferredLang = "";
 let autoPreferredUntil = 0;
 let autoOppositeStreak = 0;
 
-const AUTO_PREFERRED_MS = 8000;
-const AUTO_SWITCH_STREAK = 2;
+// Prefer Japanese: lock for 15 s, need 4 consecutive opposite-language finals to switch
+const AUTO_PREFERRED_MS  = 15000;
+const AUTO_SWITCH_STREAK = 4;
+
+// ---------------------------------------------------------------------------
+// Mic device enumeration
+// ---------------------------------------------------------------------------
+
+async function populateMicDevices() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const inputs  = devices.filter((d) => d.kind === "audioinput");
+    const prev    = micDeviceSelect.value;
+    micDeviceSelect.innerHTML = "";
+    const def = document.createElement("option");
+    def.value = "";
+    def.textContent = "Default Mic";
+    micDeviceSelect.appendChild(def);
+    inputs.forEach((d, i) => {
+      const opt = document.createElement("option");
+      opt.value = d.deviceId;
+      opt.textContent = d.label || `Microphone ${i + 1}`;
+      micDeviceSelect.appendChild(opt);
+    });
+    if (prev && [...micDeviceSelect.options].some((o) => o.value === prev)) {
+      micDeviceSelect.value = prev;
+    }
+  } catch (_) { /* permission not yet granted */ }
+}
 
 // ---------------------------------------------------------------------------
 // Transcript rendering
@@ -60,9 +89,7 @@ function updatePartial(text) {
 function addFinalEntry(text, detectedLang) {
   if (!text || text === lastFinalText) return;
   const selectedLang = languageSelect.value;
-  if (selectedLang === "auto") {
-    updateAutoLanguagePreference(text, detectedLang);
-  }
+  if (selectedLang === "auto") updateAutoLanguagePreference(text, detectedLang);
   if (shouldSuppressFinal(text, detectedLang, selectedLang)) return;
   lastFinalText = text;
   clearPartial();
@@ -78,8 +105,6 @@ function addFinalEntry(text, detectedLang) {
   transcript.appendChild(entry);
   transcript.scrollTop = transcript.scrollHeight;
 
-  // In Japanese mode, always show an English line from the translator.
-  // In auto/English mode, only translate when the text appears Japanese.
   const shouldTranslate = selectedLang === "ja" ||
     detectedLang === "ja" ||
     (selectedLang === "auto" && looksJapanese(text));
@@ -87,49 +112,50 @@ function addFinalEntry(text, detectedLang) {
 
   const enEl = document.createElement("div");
   enEl.className = "entry-en loading";
-  enEl.textContent = "translating…";
+  enEl.textContent = "…";
   entry.appendChild(enEl);
 
-  fetch("/api/translate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
-  })
-    .then((r) => r.json())
-    .then((data) => {
-      const t = data.translation || "";
-      if (t) {
-        enEl.className = "entry-en";
-        enEl.textContent = t;
-      } else {
-        enEl.remove();
+  (async () => {
+    try {
+      const resp = await fetch("/api/translate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!resp.ok || !resp.body) { enEl.remove(); return; }
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      enEl.className = "entry-en";
+      enEl.textContent = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        enEl.textContent += dec.decode(value, { stream: true });
+        transcript.scrollTop = transcript.scrollHeight;
       }
-    })
-    .catch(() => enEl.remove());
+      if (!enEl.textContent.trim()) enEl.remove();
+    } catch (_) { enEl.remove(); }
+  })();
 }
 
 function looksJapanese(text) {
   return /[\u3000-\u9fff\uff00-\uffef]/.test(text);
 }
-
 function looksEnglish(text) {
   return /[A-Za-z]/.test(text) && !looksJapanese(text);
 }
-
 function inferLanguage(text, detectedLang) {
   if (detectedLang === "ja" || detectedLang === "en") return detectedLang;
   if (looksJapanese(text)) return "ja";
-  if (looksEnglish(text)) return "en";
+  if (looksEnglish(text))  return "en";
   return "";
 }
 
-function languageLabel(lang) {
-  return lang === "ja" ? "Japanese" : "English";
-}
-
+// Auto-mode starts locked to Japanese; requires 4 consecutive other-language
+// finals before switching — so incidental English words don't break the flow.
 function resetAutoLanguageLock() {
-  autoPreferredLang = "";
-  autoPreferredUntil = 0;
+  autoPreferredLang  = languageSelect.value === "auto" ? "ja" : "";
+  autoPreferredUntil = autoPreferredLang ? Date.now() + AUTO_PREFERRED_MS : 0;
   autoOppositeStreak = 0;
 }
 
@@ -140,12 +166,10 @@ function pushLanguageConfig(lang) {
 }
 
 function setAutoLanguagePreference(nextLang, announce) {
-  autoPreferredLang = nextLang;
+  autoPreferredLang  = nextLang;
   autoPreferredUntil = Date.now() + AUTO_PREFERRED_MS;
   autoOppositeStreak = 0;
-  if (announce) {
-    addStatusLine(`[status] Auto prefers ${languageLabel(nextLang)}`);
-  }
+  if (announce) addStatusLine(`[auto] switched to ${nextLang === "ja" ? "Japanese" : "English"}`);
 }
 
 function updateAutoLanguagePreference(text, detectedLang) {
@@ -156,17 +180,13 @@ function updateAutoLanguagePreference(text, detectedLang) {
     setAutoLanguagePreference(inferred, true);
     return;
   }
-
   if (inferred === autoPreferredLang) {
     autoPreferredUntil = Date.now() + AUTO_PREFERRED_MS;
     autoOppositeStreak = 0;
     return;
   }
-
   autoOppositeStreak += 1;
-  if (autoOppositeStreak >= AUTO_SWITCH_STREAK) {
-    setAutoLanguagePreference(inferred, true);
-  }
+  if (autoOppositeStreak >= AUTO_SWITCH_STREAK) setAutoLanguagePreference(inferred, true);
 }
 
 function shouldSuppressPartial(text, detectedLang, selectedLang) {
@@ -175,31 +195,64 @@ function shouldSuppressPartial(text, detectedLang, selectedLang) {
   if (selectedLang !== "auto") return false;
   if (!autoPreferredLang || Date.now() > autoPreferredUntil) return false;
   const inferred = inferLanguage(text, detectedLang);
-  // In auto mode, keep a soft preference only for noisy partials.
   return inferred && inferred !== autoPreferredLang;
 }
 
 function shouldSuppressFinal(text, detectedLang, selectedLang) {
-  // If user selected Japanese, hide English-only hypotheses from bilingual auto behavior.
   if (selectedLang === "ja") return detectedLang === "en" || looksEnglish(text);
   if (selectedLang === "en") return detectedLang === "ja" || looksJapanese(text);
-  if (selectedLang === "auto") return false;
   return false;
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket connection & mic
+// Shared WebSocket message handler (used by both mic and viewer modes)
 // ---------------------------------------------------------------------------
 
-function setConnected(on) {
-  connectionBadge.textContent = on ? "Connected" : "Disconnected";
-  connectionBadge.className = `badge ${on ? "badge-on" : "badge-off"}`;
+function handleWsMessage(event) {
+  try {
+    const msg = JSON.parse(event.data);
+    if (msg.type === "partial") {
+      if (!shouldSuppressPartial(msg.text || "", msg.lang || "", languageSelect.value)) {
+        updatePartial(msg.text || "");
+      }
+    } else if (msg.type === "final") {
+      addFinalEntry(msg.text || "", msg.lang || "");
+    } else if (msg.type === "status") {
+      clearPartial();
+      addStatusLine(`[status] ${msg.message}`);
+    } else if (msg.type === "error") {
+      clearPartial();
+      addErrorLine(`Error: ${msg.message}`);
+    }
+  } catch {
+    addStatusLine(String(event.data));
+  }
 }
 
-function setRecording(on) {
-  recordingBadge.textContent = on ? "Mic On" : "Mic Off";
-  recordingBadge.className = `badge ${on ? "badge-on" : "badge-off"}`;
+// ---------------------------------------------------------------------------
+// Viewer mode — auto-connects to /ws/view, no mic
+// ---------------------------------------------------------------------------
+
+function wsViewUrl() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${location.host}/ws/view`;
 }
+
+function connectViewerSocket() {
+  if (ws && ws.readyState <= 1) return;
+  ws = new WebSocket(wsViewUrl());
+  ws.onopen  = () => addStatusLine("[status] Connected to transcript feed");
+  ws.onclose = () => {
+    addStatusLine("[status] Disconnected — reconnecting in 3 s…");
+    setTimeout(connectViewerSocket, 3000);
+  };
+  ws.onerror = () => {};
+  ws.onmessage = handleWsMessage;
+}
+
+// ---------------------------------------------------------------------------
+// Mic mode — teacher
+// ---------------------------------------------------------------------------
 
 function wsUrl() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -214,36 +267,28 @@ async function connectSocket() {
   await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
 
   ws.onclose = () => {
-    setConnected(false);
-    if (isRunning) { clearPartial(); addStatusLine("Connection closed."); stopMic(); }
-  };
-
-  ws.onmessage = (event) => {
-    try {
-      const msg = JSON.parse(event.data);
-      if (msg.type === "partial") {
-        if (!shouldSuppressPartial(msg.text || "", msg.lang || "", languageSelect.value)) {
-          updatePartial(msg.text || "");
+    if (isRunning) {
+      clearPartial();
+      addStatusLine("[status] Connection dropped — reconnecting…");
+      micButton.className = "btn btn-mic mic-on";
+      // Reconnect the WebSocket without stopping the mic stream
+      setTimeout(async () => {
+        try {
+          ws = null;
+          await connectSocket();
+          addStatusLine("[status] Reconnected.");
+        } catch (e) {
+          addErrorLine(`Reconnect failed — stopping mic: ${e}`);
+          stopMic();
         }
-      } else if (msg.type === "final") {
-        addFinalEntry(msg.text || "", msg.lang || "");
-      } else if (msg.type === "status") {
-        clearPartial();
-        addStatusLine(`[status] ${msg.message}`);
-      } else if (msg.type === "error") {
-        clearPartial();
-        addErrorLine(`Error: ${msg.message}`);
-      }
-    } catch {
-      addStatusLine(String(event.data));
+      }, 1500);
     }
   };
+  ws.onmessage = handleWsMessage;
 
-  if (languageSelect.value === "auto") {
-    resetAutoLanguageLock();
-  }
+  if (languageSelect.value === "auto") resetAutoLanguageLock();
   pushLanguageConfig(languageSelect.value);
-  setConnected(true);
+  micButton.className = "btn btn-mic mic-on";
 }
 
 async function startMic() {
@@ -252,9 +297,13 @@ async function startMic() {
   resetAutoLanguageLock();
   await connectSocket();
 
-  mediaStream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, noiseSuppression: true, echoCancellation: true, autoGainControl: true },
-  });
+  const deviceId = micDeviceSelect.value;
+  const audioConstraints = {
+    channelCount: 1, noiseSuppression: true, echoCancellation: true, autoGainControl: true,
+    ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+  };
+  mediaStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+  await populateMicDevices();
 
   audioContext = new AudioContext();
   await audioContext.audioWorklet.addModule("/static/pcm-worklet.js");
@@ -274,7 +323,6 @@ async function startMic() {
   isRunning = true;
   micButton.textContent = "Stop Mic";
   micButton.className = "btn btn-mic mic-on";
-  setRecording(true);
 }
 
 function stopMic() {
@@ -282,7 +330,7 @@ function stopMic() {
   resetAutoLanguageLock();
   clearPartial();
   workletNode?.disconnect(); workletNode = null;
-  sourceNode?.disconnect();  sourceNode = null;
+  sourceNode?.disconnect();  sourceNode  = null;
   mediaStream?.getTracks().forEach((t) => t.stop()); mediaStream = null;
   audioContext?.close(); audioContext = null;
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -291,26 +339,41 @@ function stopMic() {
   }
   micButton.textContent = "Start Mic";
   micButton.className = "btn btn-mic mic-off";
-  setRecording(false);
-  setConnected(false);
 }
 
-micButton.addEventListener("click", async () => {
-  if (!isRunning) {
-    try { await startMic(); }
-    catch (err) { addErrorLine(`Could not start microphone: ${err}`); stopMic(); }
-  } else {
-    stopMic();
-  }
-});
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+
+if (isViewer) {
+  // Hide mic controls; auto-connect
+  micButton.style.display      = "none";
+  micDeviceSelect.style.display = "none";
+  document.querySelector(".brand-en").textContent = "Seminar Assistant — Viewer";
+  connectViewerSocket();
+  resetAutoLanguageLock();
+} else {
+  populateMicDevices();
+
+  micButton.addEventListener("click", async () => {
+    if (!isRunning) {
+      try { await startMic(); }
+      catch (err) {
+        const msg = !navigator.mediaDevices
+          ? "Microphone not available — open this page at http://localhost:8088 (not the LAN IP) to use the mic."
+          : `Could not start microphone: ${err}`;
+        addErrorLine(msg);
+        stopMic();
+      }
+    } else {
+      stopMic();
+    }
+  });
+}
 
 languageSelect.addEventListener("change", () => {
-  if (languageSelect.value === "auto") {
-    resetAutoLanguageLock();
-  }
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    pushLanguageConfig(languageSelect.value);
-  }
+  if (languageSelect.value === "auto") resetAutoLanguageLock();
+  if (ws && ws.readyState === WebSocket.OPEN) pushLanguageConfig(languageSelect.value);
 });
 
 // ---------------------------------------------------------------------------
@@ -329,13 +392,10 @@ function addQaMessage(text, role) {
 async function sendQuestion() {
   const q = qaInput.value.trim();
   if (!q) return;
-
   qaInput.value = "";
   qaSend.disabled = true;
   addQaMessage(q, "user");
-
   const loadingEl = addQaMessage("Thinking…", "bot loading");
-
   try {
     const resp = await fetch("/api/ask", {
       method: "POST",

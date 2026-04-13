@@ -4,5 +4,7 @@ __pycache__/
 .env
 context/*
 !context/.gitkeep
+transcripts/*
+!transcripts/.gitkeep
 docs/email_*.md
 docs/email_context_dump.md

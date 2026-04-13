@@ -1,29 +1,75 @@
 import asyncio
 import json
+import logging
 import os
+import threading
+import wave
 from contextlib import suppress
+from datetime import datetime
 from pathlib import Path
+from typing import Optional, Set
 
 import httpx
 import websockets
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-REMOTE_WS_URL = os.getenv("REMOTE_WS_URL", "ws://127.0.0.1:19001/ws")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:14b")
-CONTEXT_DIR = Path("context")
+logger = logging.getLogger("app")
+
+REMOTE_WS_URL  = os.getenv("REMOTE_WS_URL", "ws://127.0.0.1:19001/ws")
+OLLAMA_URL     = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+OLLAMA_MODEL   = os.getenv("OLLAMA_MODEL", "qwen2.5:14b")
+CONTEXT_DIR    = Path("context")
+RECORDINGS_DIR = Path(os.getenv("RECORDINGS_DIR", Path.home() / "recordings"))
 
 app = FastAPI(title="Takemoto Lab Seminar Assistant")
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
+# Single persistent client — reused across all ollama requests (no per-request TCP handshake)
+_http: Optional[httpx.AsyncClient] = None
+
+# Queues for viewer WebSocket broadcast (one queue per connected viewer)
+_viewer_queues: Set[asyncio.Queue] = set()
+
+
+# ---------------------------------------------------------------------------
+# WAV recorder — writes incoming PCM to ~/recordings/session_<timestamp>.wav
+# 16 kHz, 16-bit, mono (matches the browser PCM worklet output).
+# Thread-safe: write() is called from asyncio executor threads.
+# ---------------------------------------------------------------------------
+
+class WavRecorder:
+    """Opens a WAV file immediately; finalises the header on close()."""
+
+    SAMPLE_RATE  = 16000
+    SAMPLE_WIDTH = 2   # 16-bit LE
+    CHANNELS     = 1
+
+    def __init__(self) -> None:
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.path = RECORDINGS_DIR / f"session_{ts}.wav"
+        self._wf   = wave.open(str(self.path), "wb")
+        self._wf.setnchannels(self.CHANNELS)
+        self._wf.setsampwidth(self.SAMPLE_WIDTH)
+        self._wf.setframerate(self.SAMPLE_RATE)
+        self._lock = threading.Lock()
+        logger.info("Recording started: %s", self.path)
+
+    def write(self, data: bytes) -> None:
+        with self._lock:
+            self._wf.writeframes(data)
+
+    def close(self) -> None:
+        with self._lock:
+            self._wf.close()
+        logger.info("Recording saved: %s", self.path)
+
 
 # ---------------------------------------------------------------------------
 # RAG index — loaded once at startup from context/
-# Uses character-level bigrams for CJK + word tokens for ASCII.
-# Good enough for a prototype demo without any extra dependencies.
 # ---------------------------------------------------------------------------
 
 _chunks: list[str] = []
@@ -60,11 +106,19 @@ def _retrieve(query: str, k: int = 6) -> list[str]:
 
 
 @app.on_event("startup")
-def startup() -> None:
+async def startup() -> None:
+    global _http
+    _http = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
     if CONTEXT_DIR.exists():
         for p in CONTEXT_DIR.iterdir():
             if p.suffix in {".txt", ".md", ".csv"} and p.name != ".gitkeep":
                 _index_file(p)
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    if _http:
+        await _http.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -91,26 +145,44 @@ async def health() -> dict:
 
 
 @app.post("/api/translate")
-async def translate(req: TranslateRequest) -> dict:
+async def translate(req: TranslateRequest) -> StreamingResponse:
+    """Stream translation tokens as plain text — client renders them progressively."""
     if not req.text.strip():
-        return {"translation": ""}
+        async def _empty():
+            return
+            yield
+        return StreamingResponse(_empty(), media_type="text/plain; charset=utf-8")
 
-    prompt = (
-        "Translate the following Japanese to natural English. "
-        "Reply with only the English translation, nothing else.\n\n"
-        f"Japanese: {req.text}\nEnglish:"
-    )
+    prompt = f"Translate to English. Reply with the translation only, no explanation.\n\n{req.text}"
 
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
+    async def token_stream():
+        try:
+            async with _http.stream(
+                "POST",
                 f"{OLLAMA_URL}/api/generate",
-                json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-            )
-            resp.raise_for_status()
-        return {"translation": resp.json().get("response", "").strip()}
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+                json={
+                    "model": OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "stream": True,
+                    "options": {"temperature": 0, "num_predict": 256},
+                },
+            ) as resp:
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except Exception:
+                        continue
+                    token = data.get("response", "")
+                    if token:
+                        yield token.encode()
+                    if data.get("done"):
+                        break
+        except Exception as exc:
+            logger.error("Streaming translate error: %s", exc)
+
+    return StreamingResponse(token_stream(), media_type="text/plain; charset=utf-8")
 
 
 @app.post("/api/ask")
@@ -127,19 +199,20 @@ async def ask(req: AskRequest) -> dict:
     )
 
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-            )
-            resp.raise_for_status()
+        resp = await _http.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False,
+                  "options": {"temperature": 0}},
+        )
+        resp.raise_for_status()
         return {"answer": resp.json().get("response", "").strip()}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
-# WebSocket bridge (unchanged — relays to remote transcriber)
+# WebSocket — mic client (teacher): relays audio to remote transcriber
+# and broadcasts transcript to viewer clients
 # ---------------------------------------------------------------------------
 
 
@@ -161,11 +234,20 @@ async def bridge(client_ws: WebSocket) -> None:
         await client_ws.close()
         return
 
+    recorder: Optional[WavRecorder] = None
+    loop = asyncio.get_event_loop()
+
     async def client_to_remote() -> None:
+        nonlocal recorder
         while True:
             msg = await client_ws.receive()
             if "bytes" in msg and msg["bytes"] is not None:
-                await remote_ws.send(msg["bytes"])
+                data = msg["bytes"]
+                await remote_ws.send(data)
+                # Lazy-open the WAV file on first audio chunk
+                if recorder is None:
+                    recorder = await loop.run_in_executor(None, WavRecorder)
+                await loop.run_in_executor(None, recorder.write, data)
             elif "text" in msg and msg["text"] is not None:
                 await remote_ws.send(msg["text"])
             elif msg.get("type") == "websocket.disconnect":
@@ -177,6 +259,9 @@ async def bridge(client_ws: WebSocket) -> None:
                 await client_ws.send_bytes(message)
             else:
                 await client_ws.send_text(message)
+                # Broadcast transcript to all viewer clients
+                for q in list(_viewer_queues):
+                    q.put_nowait(message)
 
     relay_tasks = [
         asyncio.create_task(client_to_remote()),
@@ -193,7 +278,50 @@ async def bridge(client_ws: WebSocket) -> None:
         with suppress(Exception):
             task.result()
 
+    if recorder is not None:
+        await loop.run_in_executor(None, recorder.close)
+
     with suppress(Exception):
         await remote_ws.close()
-    with suppress(WebSocketDisconnect):
+    with suppress(WebSocketDisconnect, RuntimeError, Exception):
+        await client_ws.close()
+
+
+# ---------------------------------------------------------------------------
+# WebSocket — viewer client (students / professor): receive-only transcript
+# ---------------------------------------------------------------------------
+
+
+@app.websocket("/ws/view")
+async def viewer(client_ws: WebSocket) -> None:
+    await client_ws.accept()
+    q: asyncio.Queue = asyncio.Queue()
+    _viewer_queues.add(q)
+
+    async def send_loop() -> None:
+        while True:
+            msg = await q.get()
+            await client_ws.send_text(msg)
+
+    async def recv_loop() -> None:
+        while True:
+            msg = await client_ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+
+    tasks = [
+        asyncio.create_task(send_loop()),
+        asyncio.create_task(recv_loop()),
+    ]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+    for task in done:
+        with suppress(Exception):
+            task.result()
+
+    _viewer_queues.discard(q)
+    with suppress(WebSocketDisconnect, Exception):
         await client_ws.close()

@@ -14,14 +14,13 @@
           <span class="brand-en">Seminar Assistant</span>
         </div>
         <div class="controls">
+          <select id="micDevice" title="Microphone source"><option value="">Default Mic</option></select>
           <select id="language" title="Transcription language">
-            <option value="auto">Auto</option>
             <option value="ja">日本語</option>
+            <option value="auto">Auto (JA/EN)</option>
             <option value="en">English</option>
           </select>
           <button id="micButton" class="btn btn-mic mic-off" type="button">Start Mic</button>
-          <span id="connection" class="badge badge-off">Disconnected</span>
-          <span id="recording" class="badge badge-off">Mic Off</span>
         </div>
       </header>
 

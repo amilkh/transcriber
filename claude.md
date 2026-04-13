@@ -4,13 +4,13 @@
 "Takemoto Lab Seminar Assistant" — a local web app that captures mic audio, transcribes JA/EN in real-time via takelab, translates JA→EN using a local LLM (ollama on takelab), and answers questions via RAG over lab knowledge base files.
 
 ## Current State
-All runtime processes are running (as of last session).
+App now runs on takelab directly (no tunnel needed for vosk/ollama).
 
 Running components:
 - Remote vosk transcriber on takelab:19001
-- SSH tunnel: local:19001→takelab:19001, local:11435→takelab:11434 (NOT 11434 — local machine has its own ollama on 11434)
+- Takelab web app: HTTP on takelab:8080, HTTPS on takelab:8443
+- SSH tunnel from local: local:8088→takelab:8080, local:8444→takelab:8443
 - Ollama service on takelab (systemd, auto-start)
-- Local FastAPI app on :8080
 
 ## What Was Built
 
@@ -48,23 +48,42 @@ Running components:
 
 ## Restart Commands
 
-1) Start remote (vosk, already systemd on takelab for ollama — just need vosk transcriber):
+Everything in one script:
 ```
-ssh takelab 'cd ~/remote-transcriber && source .venv/bin/activate && STT_ENGINE=vosk nohup uvicorn remote_server:app --host 127.0.0.1 --port 19001 > /tmp/transcriber.log 2>&1 &'
+bash scripts/start_takelab_app.sh
+```
+Then open: http://localhost:8088
+
+Manual steps if needed:
+
+1) Start vosk on takelab:
+```
+ssh takelab 'fuser -k 19001/tcp 2>/dev/null; cd ~/remote-transcriber && source .venv/bin/activate && STT_ENGINE=vosk nohup uvicorn remote_server:app --host 127.0.0.1 --port 19001 > /tmp/transcriber.log 2>&1 &'
 ```
 
-2) Start tunnel (forwards both vosk and ollama ports):
+2) Start web app on takelab (HTTP + HTTPS):
 ```
-bash scripts/start_tunnel.sh &
-```
-Note: tunnel uses local:11435 → takelab:11434 for ollama (avoids clash with local ollama on :11434)
-
-3) Start local app:
-```
-source .venv/bin/activate && REMOTE_WS_URL=ws://127.0.0.1:19001/ws OLLAMA_URL=http://127.0.0.1:11435 nohup .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080 > /tmp/local_app.log 2>&1 &
+ssh takelab 'cd ~/remote-transcriber && source .venv/bin/activate && REMOTE_WS_URL=ws://127.0.0.1:19001/ws OLLAMA_URL=http://127.0.0.1:11434 nohup .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080 > /tmp/app.log 2>&1 &'
+ssh takelab 'cd ~/remote-transcriber && source .venv/bin/activate && REMOTE_WS_URL=ws://127.0.0.1:19001/ws OLLAMA_URL=http://127.0.0.1:11434 nohup .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8443 --ssl-keyfile key.pem --ssl-certfile cert.pem > /tmp/app_ssl.log 2>&1 &'
 ```
 
-4) Open: http://127.0.0.1:8080
+3) Open SSH tunnel:
+```
+ssh -N -f -L 8088:127.0.0.1:8080 -L 8444:127.0.0.1:8443 takelab
+```
+
+4) Open: http://localhost:8088  (or https://localhost:8444 for HTTPS)
+
+## LAN Access (phone / other devices)
+takelab is WSL2, so ports are NOT directly reachable at 10.10.5.59 unless
+Windows portproxy is configured. Run ONCE in admin PowerShell on takelab's Windows:
+```powershell
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=8080 connectaddress=172.28.250.189 connectport=8080
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=8443 connectaddress=172.28.250.189 connectport=8443
+netsh advfirewall firewall add rule name="transcriber" dir=in action=allow protocol=TCP localport=8080,8443
+```
+Then from phone: https://10.10.5.59:8443 (accept self-signed cert warning)
+Note: WSL2 IP (172.28.250.189) changes on reboot — re-check with: ssh takelab 'ip addr show eth0 | grep "inet "'
 
 ## Health Checks
 ```bash
