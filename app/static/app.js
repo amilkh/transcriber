@@ -218,8 +218,10 @@ function handleWsMessage(event) {
     } else if (msg.type === "final") {
       addFinalEntry(msg.text || "", msg.lang || "");
     } else if (msg.type === "status") {
-      clearPartial();
-      addStatusLine(`[status] ${msg.message}`);
+      // Suppress routine internal messages (model ready, language change, etc.)
+      const m = msg.message || "";
+      const isNoise = /^(Remote ready|Language set to|CUDA)/i.test(m);
+      if (!isNoise) { clearPartial(); addStatusLine(m); }
     } else if (msg.type === "error") {
       clearPartial();
       addErrorLine(`Error: ${msg.message}`);

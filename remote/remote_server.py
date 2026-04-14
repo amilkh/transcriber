@@ -152,8 +152,10 @@ async def ws_transcribe(ws: WebSocket) -> None:
 SILENCE_RMS_THRESHOLD = float(os.getenv("SILENCE_RMS", "0.008"))  # ~-42 dB
 SILENCE_CHUNKS_FINAL  = int(os.getenv("SILENCE_CHUNKS", "3"))      # 3 × 200 ms = 600 ms
 
-# Raise to filter more aggressively (0.0–1.0; default faster-whisper=0.6)
-NO_SPEECH_THRESHOLD = float(os.getenv("NO_SPEECH_THRESHOLD", "0.7"))
+# Lower = more aggressive silence filtering (0.0–1.0; default faster-whisper=0.6).
+# Note: common hallucinations have high logprob so this alone won't catch them;
+# the _HALLUCINATIONS blocklist below is the primary guard.
+NO_SPEECH_THRESHOLD = float(os.getenv("NO_SPEECH_THRESHOLD", "0.5"))
 
 # Known Whisper hallucinations to silently discard (exact match after strip)
 _HALLUCINATIONS: set[str] = {
@@ -164,6 +166,8 @@ _HALLUCINATIONS: set[str] = {
     "チャンネル登録をお願いします",
     "お疲れ様でした",
     "ご清聴ありがとうございました",
+    "モデルの設定",
+    "設定",
     "Thank you for watching.",
     "Thank you for watching",
     "Please subscribe.",
@@ -177,6 +181,17 @@ _HALLUCINATIONS: set[str] = {
 def _is_hallucination(text: str) -> bool:
     t = text.strip().rstrip("。．.")
     return t in _HALLUCINATIONS or text.strip() in _HALLUCINATIONS
+
+
+def _is_repetitive_loop(text: str) -> bool:
+    """Detect Whisper looping: same short phrase repeated many times."""
+    # Split on common Japanese/English delimiters
+    parts = [p.strip() for p in text.replace("、", ",").replace("。", ",").split(",") if p.strip()]
+    if len(parts) < 4:
+        return False
+    unique = set(parts)
+    # If fewer than 30% of segments are unique, it's a loop
+    return len(unique) / len(parts) < 0.3
 
 
 def _chunk_rms(data: bytes) -> float:
@@ -231,7 +246,7 @@ async def ws_transcribe_whisper(ws: WebSocket) -> None:
                 continue
 
             text = " ".join(seg.text.strip() for seg in segments).strip()
-            if text and text != last_sent and not _is_hallucination(text):
+            if text and text != last_sent and not _is_hallucination(text) and not _is_repetitive_loop(text):
                 last_sent = text
                 last_lang = info.language
                 await ws.send_text(json.dumps({"type": "partial", "text": text, "lang": info.language}))
