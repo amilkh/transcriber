@@ -133,6 +133,7 @@ async def shutdown() -> None:
 
 class TranslateRequest(BaseModel):
     text: str
+    target_lang: str = "en"  # "en" or "zh"
 
 
 class AskRequest(BaseModel):
@@ -158,7 +159,8 @@ async def translate(req: TranslateRequest) -> StreamingResponse:
             yield
         return StreamingResponse(_empty(), media_type="text/plain; charset=utf-8")
 
-    prompt = f"Translate to English. Reply with the translation only, no explanation.\n\n{req.text}"
+    lang_name = "Mandarin Chinese (Simplified)" if req.target_lang == "zh" else "English"
+    prompt = f"Translate to {lang_name}. Reply with the translation only, no explanation.\n\n{req.text}"
 
     async def token_stream():
         try:

@@ -1,10 +1,11 @@
-const micButton    = document.getElementById("micButton");
+const micButton       = document.getElementById("micButton");
 const micDeviceSelect = document.getElementById("micDevice");
-const transcript   = document.getElementById("transcript");
-const languageSelect = document.getElementById("language");
-const qaMessages   = document.getElementById("qa-messages");
-const qaInput      = document.getElementById("qa-input");
-const qaSend       = document.getElementById("qa-send");
+const transcript      = document.getElementById("transcript");
+const languageSelect  = document.getElementById("language");
+const targetLangSelect = document.getElementById("targetLang");
+const qaMessages      = document.getElementById("qa-messages");
+const qaInput         = document.getElementById("qa-input");
+const qaSend          = document.getElementById("qa-send");
 
 // ?view  → read-only viewer (students / professor)
 const isViewer = new URLSearchParams(location.search).has("view");
@@ -132,7 +133,7 @@ function addFinalEntry(text, detectedLang) {
       const resp = await fetch("/api/translate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, target_lang: targetLangSelect.value }),
       });
       if (!resp.ok || !resp.body) { enEl.remove(); return; }
       const reader = resp.body.getReader();
@@ -383,6 +384,9 @@ if (isViewer) {
       stopMic();
     }
   });
+
+  // Auto-start mic on page load (silently skip if permission not yet granted)
+  startMic().catch(() => {});
 }
 
 languageSelect.addEventListener("change", () => {
