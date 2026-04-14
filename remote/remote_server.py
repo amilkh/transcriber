@@ -22,6 +22,19 @@ WINDOW_SAMPLES = int(os.getenv("WINDOW_SAMPLES", str(16000 * 6)))
 TRANSCRIBE_INTERVAL = float(os.getenv("TRANSCRIBE_INTERVAL", "0.6"))
 VAD_FILTER = os.getenv("VAD_FILTER", "false").lower() == "true"
 ENGINE = os.getenv("STT_ENGINE", "auto").lower()
+
+# Domain vocabulary prompt — primes the Whisper decoder to prefer these tokens.
+# Override with WHISPER_PROMPT env var; set to "" to disable.
+_DEFAULT_PROMPT = (
+    "統計解析、構造方程式モデリング、潜在変数、観測変数、因子負荷量、パス係数、"
+    "適合度、CFI、RMSEA、GFI、AGFI、SRMR、TLI、カイ二乗値、自由度、"
+    "修正指数、期待パラメータ変化、多重共線性、"
+    "平均、標準偏差、分散、歪度、尖度、標準化、"
+    "帰無仮説、対立仮説、p値、有意水準、検出力、"
+    "相関、回帰、因果関係、係数、内生変数、外生変数、"
+    "母集団、標本、信頼区間、共分散、誤差項、測定モデル、構造モデル"
+)
+INITIAL_PROMPT: str | None = os.getenv("WHISPER_PROMPT", _DEFAULT_PROMPT) or None
 VOSK_SCRIPT = os.getenv("VOSK_STREAM_SCRIPT", os.path.expanduser("~/voice/remote_stream_stt.py"))
 
 app = FastAPI(title="Remote Whisper Server")
@@ -139,6 +152,32 @@ async def ws_transcribe(ws: WebSocket) -> None:
 SILENCE_RMS_THRESHOLD = float(os.getenv("SILENCE_RMS", "0.008"))  # ~-42 dB
 SILENCE_CHUNKS_FINAL  = int(os.getenv("SILENCE_CHUNKS", "3"))      # 3 × 200 ms = 600 ms
 
+# Raise to filter more aggressively (0.0–1.0; default faster-whisper=0.6)
+NO_SPEECH_THRESHOLD = float(os.getenv("NO_SPEECH_THRESHOLD", "0.7"))
+
+# Known Whisper hallucinations to silently discard (exact match after strip)
+_HALLUCINATIONS: set[str] = {
+    "ご視聴ありがとうございました",
+    "ありがとうございました",
+    "字幕は自動生成されています",
+    "字幕制作",
+    "チャンネル登録をお願いします",
+    "お疲れ様でした",
+    "ご清聴ありがとうございました",
+    "Thank you for watching.",
+    "Thank you for watching",
+    "Please subscribe.",
+    "Subtitles by",
+    "[Music]",
+    "[Applause]",
+    "[Laughter]",
+}
+
+
+def _is_hallucination(text: str) -> bool:
+    t = text.strip().rstrip("。．.")
+    return t in _HALLUCINATIONS or text.strip() in _HALLUCINATIONS
+
 
 def _chunk_rms(data: bytes) -> float:
     samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
@@ -176,6 +215,8 @@ async def ws_transcribe_whisper(ws: WebSocket) -> None:
                     condition_on_previous_text=False,
                     without_timestamps=True,
                     temperature=0.0,
+                    initial_prompt=INITIAL_PROMPT,
+                    no_speech_threshold=NO_SPEECH_THRESHOLD,
                 )
             except Exception as exc:
                 if RUNTIME_DEVICE == "cuda" and _is_cuda_runtime_error(exc):
@@ -190,7 +231,7 @@ async def ws_transcribe_whisper(ws: WebSocket) -> None:
                 continue
 
             text = " ".join(seg.text.strip() for seg in segments).strip()
-            if text and text != last_sent:
+            if text and text != last_sent and not _is_hallucination(text):
                 last_sent = text
                 last_lang = info.language
                 await ws.send_text(json.dumps({"type": "partial", "text": text, "lang": info.language}))
