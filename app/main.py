@@ -33,6 +33,11 @@ _http: Optional[httpx.AsyncClient] = None
 # Queues for viewer WebSocket broadcast (one queue per connected viewer)
 _viewer_queues: Set[asyncio.Queue] = set()
 
+# Rolling session transcript — final utterances from the current server session.
+# Cleared on server restart; capped at 200 entries to avoid unbounded growth.
+_session_transcript: list[str] = []
+_SESSION_TRANSCRIPT_CAP = 200
+
 
 # ---------------------------------------------------------------------------
 # WAV recorder — writes incoming PCM to ~/recordings/session_<timestamp>.wav
@@ -188,13 +193,17 @@ async def translate(req: TranslateRequest) -> StreamingResponse:
 @app.post("/api/ask")
 async def ask(req: AskRequest) -> dict:
     chunks = _retrieve(req.question)
-    context_text = "\n---\n".join(chunks) if chunks else "(no relevant context found)"
+    context_text = "\n---\n".join(chunks) if chunks else "(none)"
+
+    recent = _session_transcript[-50:]  # last 50 utterances
+    transcript_text = "\n".join(recent) if recent else "(nothing transcribed yet)"
 
     prompt = (
         "You are a helpful assistant for the Takemoto Lab at the University of Fukui. "
-        "Answer the question concisely using the provided lab context. "
-        "If the context does not contain enough information, say so briefly.\n\n"
-        f"Lab Context:\n{context_text}\n\n"
+        "Answer the question concisely. Use the session transcript first for questions "
+        "about what was discussed today, and the lab knowledge base for general lab info.\n\n"
+        f"Today's session transcript (most recent last):\n{transcript_text}\n\n"
+        f"Lab knowledge base:\n{context_text}\n\n"
         f"Question: {req.question}\nAnswer:"
     )
 
@@ -262,6 +271,15 @@ async def bridge(client_ws: WebSocket) -> None:
                 # Broadcast transcript to all viewer clients
                 for q in list(_viewer_queues):
                     q.put_nowait(message)
+                # Append finals to session transcript for Q&A context
+                try:
+                    parsed = json.loads(message)
+                    if parsed.get("type") == "final" and parsed.get("text"):
+                        _session_transcript.append(parsed["text"])
+                        if len(_session_transcript) > _SESSION_TRANSCRIPT_CAP:
+                            del _session_transcript[:-_SESSION_TRANSCRIPT_CAP]
+                except Exception:
+                    pass
 
     relay_tasks = [
         asyncio.create_task(client_to_remote()),

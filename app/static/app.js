@@ -9,6 +9,8 @@ const qaSend       = document.getElementById("qa-send");
 // ?view  → read-only viewer (students / professor)
 const isViewer = new URLSearchParams(location.search).has("view");
 
+const PREFERRED_MIC = "AT2020USB-X";
+
 let ws;
 let audioContext;
 let mediaStream;
@@ -33,22 +35,32 @@ async function populateMicDevices() {
   try {
     const devices = await navigator.mediaDevices.enumerateDevices();
     const inputs  = devices.filter((d) => d.kind === "audioinput");
-    const prev    = micDeviceSelect.value;
+    // Restore saved id, or fall back to current selection
+    const saved = localStorage.getItem("preferredMicId");
+    const prev  = micDeviceSelect.value || saved;
     micDeviceSelect.innerHTML = "";
     const def = document.createElement("option");
     def.value = "";
     def.textContent = "Default Mic";
     micDeviceSelect.appendChild(def);
+    let preferredId = null;
     inputs.forEach((d, i) => {
       const opt = document.createElement("option");
       opt.value = d.deviceId;
       opt.textContent = d.label || `Microphone ${i + 1}`;
       micDeviceSelect.appendChild(opt);
+      if (!preferredId && d.label.includes(PREFERRED_MIC)) preferredId = d.deviceId;
     });
     if (prev && [...micDeviceSelect.options].some((o) => o.value === prev)) {
       micDeviceSelect.value = prev;
+    } else if (preferredId) {
+      micDeviceSelect.value = preferredId;
     }
   } catch (_) { /* permission not yet granted */ }
+}
+
+function saveMicPreference() {
+  localStorage.setItem("preferredMicId", micDeviceSelect.value);
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +389,8 @@ languageSelect.addEventListener("change", () => {
   if (languageSelect.value === "auto") resetAutoLanguageLock();
   if (ws && ws.readyState === WebSocket.OPEN) pushLanguageConfig(languageSelect.value);
 });
+
+micDeviceSelect.addEventListener("change", saveMicPreference);
 
 // ---------------------------------------------------------------------------
 // Q&A panel
