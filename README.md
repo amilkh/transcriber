@@ -9,8 +9,8 @@ no cloud, no data leaves the university network.
 ## Architecture
 
 ```
-Browser (teacher)          GPU server (e.g. takelab 10.10.5.59, RTX 5090)
-─────────────────          ──────────────────────────────────────────────
+Browser (teacher)          GPU server (e.g. 10.10.5.60, RTX GPU)
+─────────────────          ────────────────────────────────────
 Mic → PCM 16kHz  ──WS──▶  FastAPI app  ──WS──▶  Whisper large-v3 (CUDA)
                            │                        │
                            │◀── partial/final text ─┘
@@ -28,64 +28,72 @@ Recordings are saved as WAV files to `~/recordings/` on the GPU server.
 
 ## Setting Up a New GPU Server (Windows + WSL2)
 
-Follow these steps in order on the new machine.
+The goal is to minimise time on the physical machine — after step 2 everything
+is done over SSH from your laptop.
 
-### 1. Enable WSL2 (Windows, admin PowerShell)
+---
+
+### Step 1 — Windows machine (physical access, admin PowerShell)
+
+This is the only step that requires sitting at the machine.
+Open an **admin PowerShell** and run `scripts/setup_windows_portproxy.ps1`,
+or paste the commands below directly.
+
+**What it does:**
+- Installs WSL2 + Ubuntu (reboots if needed — re-run after reboot)
+- Installs `openssh-server` and `zstd` in WSL2
+- Starts SSH so you can connect remotely
+- Sets up Windows portproxy: LAN IP → WSL2 for ports 22 (SSH), 8080, 8443
+- Adds firewall rules
+- Prints the SSH command to use from your laptop
 
 ```powershell
-wsl --install
-# Reboot when prompted, then open Ubuntu from the Start menu to finish setup
+# Detect WSL2 IP
+$wslIp = (wsl -d Ubuntu -- ip addr show eth0 2>$null | Select-String "inet ").ToString().Trim().Split()[1].Split("/")[0]
+
+# Install SSH + zstd in WSL2, start SSH, add to .bashrc
+wsl -d Ubuntu -- bash -c "sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server zstd && sudo service ssh start && grep -q 'service ssh' ~/.bashrc || echo 'sudo service ssh start 2>/dev/null' >> ~/.bashrc"
+
+# Portproxy: forward ports 22, 8080, 8443 from Windows LAN -> WSL2
+foreach ($port in @(22, 8080, 8443)) {
+    netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=$port 2>$null
+    netsh interface portproxy add    v4tov4 listenaddress=0.0.0.0 listenport=$port connectaddress=$wslIp connectport=$port
+}
+
+# Firewall
+netsh advfirewall firewall delete rule name="transcriber" 2>$null
+netsh advfirewall firewall add    rule name="transcriber" dir=in action=allow protocol=TCP localport=22,8080,8443
+
+# Print LAN IP + SSH command
+$winIp = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notmatch '^(127\.|172\.|169\.)' } | Select-Object -First 1).IPAddress
+Write-Host "SSH in from your laptop: ssh <username>@$winIp"
 ```
 
-If WSL is already installed but on version 1:
-```powershell
-wsl --set-default-version 2
-```
+> **First time only:** If WSL2/Ubuntu is not installed yet, run `wsl --install -d Ubuntu`
+> first, reboot, open Ubuntu from the Start menu to set your username/password, then
+> run the block above.
 
-### 2. Install NVIDIA drivers and CUDA (Windows)
+> **Per reboot:** The portproxy may need to be re-run if the WSL2 IP changed.
+> Check with `wsl -d Ubuntu -- ip addr show eth0` — if the IP is the same as the
+> portproxy entry (`netsh interface portproxy show all`) no action needed.
 
-- Install the latest **NVIDIA Game Ready or Studio driver** from nvidia.com (Windows version — not Linux).
-- WSL2 shares the Windows GPU driver automatically; no separate Linux driver needed.
-- Verify inside WSL2 after driver install:
-  ```bash
-  nvidia-smi
-  ```
+---
 
-### 3. Enable SSH server in WSL2
+### Step 2 — From your laptop (SSH only from here)
 
-```bash
-# You may need to enable VPN to connect to apt https://www.cii.u-fukui.ac.jp/service/local/net/vpninfo.html
-sudo apt update && sudo apt install -y openssh-server
-# Allow password or key auth — edit /etc/ssh/sshd_config if needed
-sudo service ssh start
-# Make SSH start automatically (add to ~/.bashrc or use a startup task):
-echo 'sudo service ssh start 2>/dev/null' >> ~/.bashrc
-```
+Add the server to `~/.ssh/config` on your laptop:
 
-Get the WSL2 IP (needed for portproxy later):
-```bash
-ip addr show eth0 | grep 'inet '
-# e.g. inet 172.28.250.189/20 — note this address
-```
-
-### 4. Set up SSH key access from your laptop
-
-On your **laptop** (the machine you'll run the browser from):
-```bash
-# Generate a key if you don't have one
-ssh-keygen -t ed25519
-
-# Copy it to the GPU server's WSL2
-ssh-copy-id <your-wsl2-username>@<windows-lan-ip>
-```
-
-Add an entry to `~/.ssh/config` on your laptop:
 ```
 Host takelab
-    HostName 10.10.5.59        # replace with the Windows LAN IP
+    HostName 10.10.5.60        # replace with Windows LAN IP printed in step 1
     User amil                  # replace with your WSL2 username
     ServerAliveInterval 10
     ServerAliveCountMax 3
+```
+
+Copy your SSH key (or use password auth for now):
+```bash
+ssh-copy-id amil@10.10.5.60
 ```
 
 Test:
@@ -93,11 +101,32 @@ Test:
 ssh takelab 'echo ok'
 ```
 
-### 5. Install Python and repo dependencies (WSL2)
+---
+
+### Step 3 — Install NVIDIA drivers (Windows machine, one-time)
+
+Download and install the latest **NVIDIA Game Ready or Studio driver** from nvidia.com
+(Windows version — WSL2 inherits it automatically, no separate Linux driver needed).
+
+Verify in WSL2:
+```bash
+ssh takelab 'nvidia-smi'
+```
+
+---
+
+### Step 4 — Install dependencies (via SSH)
 
 ```bash
-sudo apt install -y python3 python3-venv python3-pip git
+ssh takelab
+sudo apt-get install -y python3 python3-venv python3-pip git zstd
+```
 
+---
+
+### Step 5 — Clone the repo and install Python packages (via SSH)
+
+```bash
 git clone https://github.com/amilkh/transcriber.git ~/remote-transcriber
 cd ~/remote-transcriber
 python3 -m venv .venv
@@ -106,11 +135,13 @@ pip install fastapi "uvicorn[standard]" websockets httpx pydantic \
             faster-whisper soundfile numpy ctranslate2
 ```
 
-### 6. Install Ollama and pull the LLM (WSL2)
+---
+
+### Step 6 — Install Ollama and pull the LLM (via SSH)
 
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
-ollama serve &         # or set up as a service
+ollama serve &
 ollama pull qwen2.5:14b
 ```
 
@@ -119,47 +150,36 @@ Verify:
 curl http://127.0.0.1:11434/api/tags
 ```
 
-### 7. Find the CUDA library path (WSL2)
+---
 
-faster-whisper needs CUDA libraries at runtime. Find them:
+### Step 7 — Find the CUDA library path (via SSH)
+
+faster-whisper needs CUDA shared libraries at runtime. Find them:
 ```bash
-find /usr/local/lib/ollama -name 'libcublas*' 2>/dev/null | head -3
-find ~/.venv -name 'libcublas*' 2>/dev/null | head -3
-# e.g. /usr/local/lib/ollama/cuda_v12 and
-#      ~/llm/lib/python3.10/site-packages/nvidia/cublas/lib
+find /usr/local/lib/ollama -name 'libcublas*' 2>/dev/null | head -2
+find ~/.venv -name 'libcublas*' 2>/dev/null | head -2
+python3 --version
 ```
 
-Update `scripts/start_takelab_app.sh` with your paths (the `LD_LIBRARY_PATH` line).
+Open `scripts/start_takelab_app.sh` and update the `LD_LIBRARY_PATH` line with your
+paths (substitute the Python version returned above, e.g. `python3.12`).
 
-### 8. Generate a self-signed TLS certificate (WSL2)
+---
 
-Required for HTTPS on port 8443 (needed for `getUserMedia` on phones over LAN):
+### Step 8 — Generate a self-signed TLS certificate (via SSH)
+
+Required for HTTPS on port 8443 (phones need HTTPS for microphone access):
 ```bash
 cd ~/remote-transcriber
 openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 3650 -nodes \
   -subj "/CN=seminar-assistant"
 ```
 
-### 9. Expose WSL2 to the LAN (Windows, admin PowerShell)
-
-WSL2 is not directly reachable on the LAN — Windows portproxy bridges the gap.
-This script forwards **SSH (22), HTTP (8080), and HTTPS (8443)** from the Windows
-LAN IP → WSL2. Run it once per reboot (WSL2 IP changes on every restart):
-
-```powershell
-# From repo root in admin PowerShell:
-.\scripts\setup_windows_portproxy.ps1
-```
-
-The script auto-detects the WSL2 IP and prints the correct SSH and app URLs when done.
-
-> You must run this before you can SSH into WSL2 from your laptop or access the app on the LAN.
-
 ---
 
 ## Starting the System
 
-Run this once per session from this repo **on your laptop**:
+Run once per session from this repo **on your laptop**:
 
 ```bash
 bash scripts/start_takelab_app.sh
@@ -173,7 +193,7 @@ This:
 ### Manual start (if the script fails)
 
 ```bash
-# 1. Start Whisper large-v3 on GPU
+# 1. Whisper transcriber
 ssh takelab '
   cd ~/remote-transcriber && source .venv/bin/activate
   LD_LIBRARY_PATH=/home/amil/llm/lib/python3.10/site-packages/nvidia/cublas/lib:/usr/local/lib/ollama/cuda_v12 \
@@ -181,7 +201,7 @@ ssh takelab '
   nohup uvicorn remote_server:app --host 127.0.0.1 --port 19001 > /tmp/transcriber.log 2>&1 &
 '
 
-# 2. Start web app
+# 2. Web app
 ssh takelab '
   cd ~/remote-transcriber && source .venv/bin/activate
   REMOTE_WS_URL=ws://127.0.0.1:19001/ws OLLAMA_URL=http://127.0.0.1:11434 \
@@ -190,7 +210,7 @@ ssh takelab '
   nohup .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8443 --ssl-keyfile key.pem --ssl-certfile cert.pem > /tmp/app_ssl.log 2>&1 &
 '
 
-# 3. SSH tunnel (laptop → GPU server)
+# 3. SSH tunnels (laptop → GPU server)
 ssh -N -f -o ServerAliveInterval=10 -o ServerAliveCountMax=3 \
   -L 8088:127.0.0.1:8080 -L 8444:127.0.0.1:8443 takelab
 ```
@@ -202,15 +222,16 @@ ssh -N -f -o ServerAliveInterval=10 -o ServerAliveCountMax=3 \
 | Who | URL | Mic |
 |-----|-----|-----|
 | Teacher (laptop) | `http://localhost:8088` | ✓ secure via tunnel |
-| Professor / students (LAN) | `http://10.10.5.59:8080/?view` | read-only |
-| Phone / tablet (LAN, HTTPS) | `https://10.10.5.59:8443/?view` | read-only |
+| Professor / students (LAN) | `http://10.10.5.60:8080/?view` | read-only |
+| Phone / tablet (LAN, HTTPS) | `https://10.10.5.60:8443/?view` | read-only |
 
-> Replace `10.10.5.59` with your GPU server's Windows LAN IP.
+> Replace `10.10.5.60` with your GPU server's Windows LAN IP.
 
-**Phone setup (first time only):** Open `https://10.10.5.59:8443/?view`, tap Advanced →
+**Phone setup (first time only):** Open `https://10.10.5.60:8443/?view`, tap Advanced →
 Accept the self-signed certificate warning once.
 
 **Viewer mode** (`?view`): auto-connects, shows live transcript + Lab Assistant Q&A, no mic.
+Mic auto-starts on page load for the teacher URL.
 
 ---
 
@@ -219,7 +240,7 @@ Accept the self-signed certificate warning once.
 - Default transcription: **Japanese** (`ja`)
 - Switch to **Auto (JA/EN)** for mixed sessions — auto-detects per utterance, prefers JA
 - Translation target: **→ English** or **→ 中文** (select in top bar)
-- Silence detection: ~600 ms of quiet triggers a final transcript entry and translation
+- Silence detection: ~600 ms of quiet triggers a final entry and translation
 
 ---
 
@@ -248,21 +269,19 @@ Drop `.txt`, `.md`, or `.csv` files into `context/` and restart the web app.
 The Lab Assistant answers questions by searching these files **and** the current
 session's transcript (last 50 utterances).
 
-Current content: LINE chat history (178 chunks).
-
 ---
 
 ## Health Checks
 
 ```bash
-# Whisper transcriber (on GPU server)
+# Whisper transcriber
 ssh takelab 'curl -s http://127.0.0.1:19001/health'
 
 # Web app (via tunnel)
 no_proxy=127.0.0.1 curl -s http://127.0.0.1:8088/api/health
 
 # Web app (LAN direct)
-curl -s http://10.10.5.59:8080/api/health
+curl -s http://10.10.5.60:8080/api/health
 
 # Ollama
 ssh takelab 'curl -s http://127.0.0.1:11434/api/tags'
@@ -287,6 +306,6 @@ ssh takelab 'tail -f /tmp/app.log'
 | `remote/remote_server.py` | Whisper transcriber (runs on GPU server) |
 | `scripts/start_takelab_app.sh` | One-command startup (run from laptop) |
 | `scripts/transcribe_batch.sh` | Batch transcribe recordings → transcript file |
-| `scripts/setup_windows_portproxy.ps1` | Windows portproxy for LAN access (run once as admin per reboot) |
+| `scripts/setup_windows_portproxy.ps1` | Windows setup: WSL2, SSH, portproxy (run as admin, re-run per reboot if IP changed) |
 | `context/` | Knowledge base files (gitignored — drop files here) |
 | `transcripts/` | Session transcripts (gitignored) |
