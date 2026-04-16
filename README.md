@@ -54,6 +54,7 @@ wsl --set-default-version 2
 ### 3. Enable SSH server in WSL2
 
 ```bash
+# You may need to enable VPN to connect to apt https://www.cii.u-fukui.ac.jp/service/local/net/vpninfo.html
 sudo apt update && sudo apt install -y openssh-server
 # Allow password or key auth — edit /etc/ssh/sshd_config if needed
 sudo service ssh start
@@ -139,23 +140,20 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 3650 -nod
   -subj "/CN=seminar-assistant"
 ```
 
-### 9. Expose the app to the classroom LAN (Windows, admin PowerShell)
+### 9. Expose WSL2 to the LAN (Windows, admin PowerShell)
 
 WSL2 is not directly reachable on the LAN — Windows portproxy bridges the gap.
-Run the helper script (or the commands below) once per reboot:
+This script forwards **SSH (22), HTTP (8080), and HTTPS (8443)** from the Windows
+LAN IP → WSL2. Run it once per reboot (WSL2 IP changes on every restart):
 
 ```powershell
-# Automated (run from repo root in admin PowerShell):
+# From repo root in admin PowerShell:
 .\scripts\setup_windows_portproxy.ps1
-
-# Or manually (replace 172.28.x.x with your WSL2 IP from step 3):
-netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=8080 connectaddress=172.28.250.189 connectport=8080
-netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=8443 connectaddress=172.28.250.189 connectport=8443
-netsh advfirewall firewall add rule name="transcriber" dir=in action=allow protocol=TCP localport=8080,8443
 ```
 
-> WSL2 gets a new IP on every reboot — re-run the portproxy script each time,
-> or use `scripts/setup_windows_portproxy.ps1` which auto-detects the current IP.
+The script auto-detects the WSL2 IP and prints the correct SSH and app URLs when done.
+
+> You must run this before you can SSH into WSL2 from your laptop or access the app on the LAN.
 
 ---
 
