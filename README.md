@@ -105,12 +105,15 @@ ssh takelab 'echo ok'
 
 ### Step 3 — Install NVIDIA drivers (Windows machine, one-time)
 
-Download and install the latest **NVIDIA Game Ready or Studio driver** from nvidia.com
-(Windows version — WSL2 inherits it automatically, no separate Linux driver needed).
+Download and install the latest driver from:
+**https://www.nvidia.com/Download/index.aspx**
 
-Verify in WSL2:
+Select your GPU model, choose **Game Ready** or **Studio** driver, Windows version.
+WSL2 inherits the Windows GPU driver automatically — no separate Linux driver needed.
+
+Verify over SSH after install:
 ```bash
-ssh takelab 'nvidia-smi'
+ssh takelab2 'nvidia-smi'
 ```
 
 ---
