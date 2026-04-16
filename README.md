@@ -80,6 +80,12 @@ Write-Host "SSH in from your laptop:  ssh <username>@$winIp"
 
 You can now leave the machine — everything after this is remote.
 
+> **Lock-screen note:** WSL2 can be suspended when Windows locks, killing SSH and
+> all running processes. The script registers a Task Scheduler task (`WSL2-KeepAlive`)
+> that runs `wsl -d Ubuntu -- sleep infinity` at startup/login to prevent this.
+> If WSL2 still dies after a lock, re-run the script or start the task manually:
+> `Start-ScheduledTask -TaskName "WSL2-KeepAlive"`
+
 ---
 
 ### Step 3 — SSH key setup (on your laptop)

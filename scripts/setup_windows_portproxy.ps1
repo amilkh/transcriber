@@ -57,7 +57,25 @@ foreach ($port in @(22, 8080, 8443)) {
 netsh advfirewall firewall delete rule name="transcriber" 2>$null
 netsh advfirewall firewall add    rule name="transcriber" dir=in action=allow protocol=TCP localport=22,8080,8443
 
-# Detect Windows LAN IP
+# ── Keep WSL2 alive when screen is locked ────────────────────────────────────
+# WSL2 can be suspended when Windows locks, killing SSH and all processes.
+# This scheduled task runs at startup and on unlock, keeping a WSL process alive.
+
+$taskName  = "WSL2-KeepAlive"
+$taskAction = New-ScheduledTaskAction -Execute "wsl.exe" -Argument "-d Ubuntu -- sleep infinity"
+$triggers  = @(
+    $(New-ScheduledTaskTrigger -AtStartup),
+    $(New-ScheduledTaskTrigger -AtLogOn)
+)
+$settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1)
+$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
+
+Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+Register-ScheduledTask -TaskName $taskName -Action $taskAction -Trigger $triggers -Settings $settings -Principal $principal | Out-Null
+Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+Write-Host "WSL2 keep-alive task registered and started." -ForegroundColor Green
+
+# ── Detect Windows LAN IP ─────────────────────────────────────────────────────
 $winIp = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
     $_.IPAddress -notmatch '^(127\.|172\.|169\.)'
 } | Select-Object -First 1).IPAddress
