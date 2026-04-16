@@ -28,33 +28,42 @@ Recordings are saved as WAV files to `~/recordings/` on the GPU server.
 
 ## Setting Up a New GPU Server (Windows + WSL2)
 
-The goal is to minimise time on the physical machine — after step 2 everything
-is done over SSH from your laptop.
+Steps 1–2 require physical access to the machine. Everything after that is SSH only.
 
 ---
 
-### Step 1 — Windows machine (physical access, admin PowerShell)
-
-This is the only step that requires sitting at the machine.
-Open an **admin PowerShell** and run `scripts/setup_windows_portproxy.ps1`,
-or paste the commands below directly.
-
-**What it does:**
-- Installs WSL2 + Ubuntu (reboots if needed — re-run after reboot)
-- Installs `openssh-server` and `zstd` in WSL2
-- Starts SSH so you can connect remotely
-- Sets up Windows portproxy: LAN IP → WSL2 for ports 22 (SSH), 8080, 8443
-- Adds firewall rules
-- Prints the SSH command to use from your laptop
+### Step 1 — Install WSL2 + Ubuntu (Windows, admin PowerShell, one-time)
 
 ```powershell
-# Detect WSL2 IP
+wsl --install -d Ubuntu
+```
+
+Reboot when prompted. After reboot, Ubuntu opens automatically — set your Linux
+username and password, then close the window.
+
+---
+
+### Step 2 — NVIDIA drivers + SSH + LAN access (Windows, admin PowerShell)
+
+Install NVIDIA drivers first if not already installed:
+**https://www.nvidia.com/Download/index.aspx** — select your GPU, choose Game Ready
+or Studio driver, Windows version. WSL2 inherits it automatically (no Linux driver needed).
+
+Then run these commands. Re-run after reboot only if the WSL2 IP changed
+(check: `netsh interface portproxy show all`).
+
+```powershell
+# Verify GPU is visible in WSL2 (install drivers above first if this fails)
+wsl -d Ubuntu -- nvidia-smi
+
+# Install SSH, generate host keys (fixes 'connection reset' on first run), start SSH
+wsl -d Ubuntu -- bash -c "sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server zstd && sudo ssh-keygen -A && sudo service ssh restart && grep -q 'service ssh' ~/.bashrc || echo 'sudo service ssh start 2>/dev/null' >> ~/.bashrc"
+
+# Get WSL2 IP
 $wslIp = (wsl -d Ubuntu -- ip addr show eth0 2>$null | Select-String "inet ").ToString().Trim().Split()[1].Split("/")[0]
+Write-Host "WSL2 IP: $wslIp"
 
-# Install SSH + zstd in WSL2, start SSH, add to .bashrc
-wsl -d Ubuntu -- bash -c "sudo apt-get update -qq && sudo apt-get install -y -qq openssh-server zstd && sudo service ssh start && grep -q 'service ssh' ~/.bashrc || echo 'sudo service ssh start 2>/dev/null' >> ~/.bashrc"
-
-# Portproxy: forward ports 22, 8080, 8443 from Windows LAN -> WSL2
+# Portproxy: forward ports 22, 8080, 8443 from Windows LAN IP -> WSL2
 foreach ($port in @(22, 8080, 8443)) {
     netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=$port 2>$null
     netsh interface portproxy add    v4tov4 listenaddress=0.0.0.0 listenport=$port connectaddress=$wslIp connectport=$port
@@ -64,56 +73,31 @@ foreach ($port in @(22, 8080, 8443)) {
 netsh advfirewall firewall delete rule name="transcriber" 2>$null
 netsh advfirewall firewall add    rule name="transcriber" dir=in action=allow protocol=TCP localport=22,8080,8443
 
-# Print LAN IP + SSH command
+# Print Windows LAN IP + SSH command
 $winIp = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notmatch '^(127\.|172\.|169\.)' } | Select-Object -First 1).IPAddress
-Write-Host "SSH in from your laptop: ssh <username>@$winIp"
+Write-Host "SSH in from your laptop:  ssh <username>@$winIp"
 ```
 
-> **First time only:** If WSL2/Ubuntu is not installed yet, run `wsl --install -d Ubuntu`
-> first, reboot, open Ubuntu from the Start menu to set your username/password, then
-> run the block above.
-
-> **Per reboot:** The portproxy may need to be re-run if the WSL2 IP changed.
-> Check with `wsl -d Ubuntu -- ip addr show eth0` — if the IP is the same as the
-> portproxy entry (`netsh interface portproxy show all`) no action needed.
+You can now leave the machine — everything after this is remote.
 
 ---
 
-### Step 2 — From your laptop (SSH only from here)
+### Step 3 — SSH key setup (on your laptop)
 
-Add the server to `~/.ssh/config` on your laptop:
+Add the server to `~/.ssh/config`:
 
 ```
-Host takelab
-    HostName 10.10.5.60        # replace with Windows LAN IP printed in step 1
+Host takelab2
+    HostName 10.10.5.60        # replace with Windows LAN IP printed above
     User amil                  # replace with your WSL2 username
     ServerAliveInterval 10
     ServerAliveCountMax 3
 ```
 
-Copy your SSH key (or use password auth for now):
+Copy your SSH key:
 ```bash
 ssh-copy-id amil@10.10.5.60
-```
-
-Test:
-```bash
-ssh takelab 'echo ok'
-```
-
----
-
-### Step 3 — Install NVIDIA drivers (Windows machine, one-time)
-
-Download and install the latest driver from:
-**https://www.nvidia.com/Download/index.aspx**
-
-Select your GPU model, choose **Game Ready** or **Studio** driver, Windows version.
-WSL2 inherits the Windows GPU driver automatically — no separate Linux driver needed.
-
-Verify over SSH after install:
-```bash
-ssh takelab2 'nvidia-smi'
+ssh takelab2 'echo ok'
 ```
 
 ---
@@ -121,7 +105,7 @@ ssh takelab2 'nvidia-smi'
 ### Step 4 — Install dependencies (via SSH)
 
 ```bash
-ssh takelab
+ssh takelab2
 sudo apt-get install -y python3 python3-venv python3-pip git zstd
 ```
 
