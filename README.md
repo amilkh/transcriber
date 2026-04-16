@@ -84,19 +84,28 @@ You can now leave the machine — everything after this is remote.
 
 ### Step 3 — SSH key setup (on your laptop)
 
-Add the server to `~/.ssh/config`:
+Generate a key if you don't have one yet:
+```bash
+ls ~/.ssh/id_ed25519.pub 2>/dev/null || ssh-keygen -t ed25519
+```
 
+Copy it to the server (enter the Linux password you set in Step 1 when prompted):
+```bash
+ssh-copy-id -i ~/.ssh/id_ed25519.pub <username>@<windows-lan-ip>
+```
+
+Add the server to `~/.ssh/config`:
 ```
 Host takelab2
-    HostName 10.10.5.60        # replace with Windows LAN IP printed above
+    HostName 10.10.5.60        # replace with Windows LAN IP
     User amil                  # replace with your WSL2 username
+    IdentityFile ~/.ssh/id_ed25519
     ServerAliveInterval 10
     ServerAliveCountMax 3
 ```
 
-Copy your SSH key:
+Test:
 ```bash
-ssh-copy-id amil@10.10.5.60
 ssh takelab2 'echo ok'
 ```
 
