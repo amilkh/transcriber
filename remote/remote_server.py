@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import os
 import subprocess
 import threading
@@ -276,7 +277,7 @@ def _is_repetitive_loop(text: str) -> bool:
     if len(parts) >= 4 and len(set(parts)) / len(parts) < 0.3:
         return True
 
-    # Check 2: raw consecutive repetition without delimiters (e.g. 大学院大学院大学院…)
+    # Check 2: raw consecutive repetition starting from position 0 (e.g. 大学院大学院…)
     n = len(text)
     for unit_len in range(2, min(14, n // 4 + 1)):
         unit = text[:unit_len]
@@ -287,6 +288,10 @@ def _is_repetitive_loop(text: str) -> bool:
             pos += unit_len
         if count >= 4 and count * unit_len >= n * 0.6:
             return True
+
+    # Check 3: repetition anywhere in the string (e.g. …人間の人間の人間の人間の…)
+    if re.search(r'(.{2,10})\1{4,}', text):
+        return True
 
     return False
 
