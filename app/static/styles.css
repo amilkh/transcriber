@@ -1,18 +1,4 @@
 :root {
-  --bg: #f0ede6;
-  --paper: #fffdf9;
-  --ink: #1c2419;
-  --ink-2: #4a5c48;
-  --accent: #1a7a5e;
-  --accent-dim: #d4ede7;
-  --border: #d0d9cd;
-  --danger: #b84040;
-  --qa-user: #1a7a5e;
-  --qa-bot: #f5f8f5;
-  --radius: 14px;
-}
-
-[data-theme="dark"] {
   --bg: #0d0f14;
   --paper: #13161e;
   --ink: #dde2d8;
@@ -23,35 +9,8 @@
   --danger: #e06060;
   --qa-user: #1d7a62;
   --qa-bot: #191d28;
+  --radius: 14px;
 }
-
-[data-theme="dark"] select,
-[data-theme="dark"] .qa-input-row input {
-  background: #1a1e28;
-  color: var(--ink);
-  border-color: var(--border);
-}
-
-[data-theme="dark"] .panel-header {
-  background: rgba(0,0,0,0.2);
-}
-
-[data-theme="dark"] .topbar {
-  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-}
-
-.theme-toggle {
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 7px 14px;
-  font: inherit;
-  font-size: 0.85rem;
-  background: transparent;
-  color: var(--ink-2);
-  cursor: pointer;
-  transition: color 0.15s, border-color 0.15s;
-}
-.theme-toggle:hover { color: var(--ink); border-color: var(--ink-2); }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -95,7 +54,8 @@ select {
   padding: 7px 14px;
   font: inherit;
   font-size: 0.9rem;
-  background: #fff;
+  background: var(--paper);
+  color: var(--ink);
   cursor: pointer;
 }
 
@@ -156,7 +116,7 @@ select {
   justify-content: space-between;
   padding: 12px 18px;
   border-bottom: 1px solid var(--border);
-  background: rgba(255,255,255,0.6);
+  background: rgba(0,0,0,0.15);
 }
 
 .panel-header h2 { font-size: 1rem; font-weight: 700; }
@@ -221,7 +181,7 @@ select {
 /* ── Q&A pane ────────────────────────────────────────── */
 
 .panel-qa {
-  background: #f8faf8;
+  background: var(--paper);
 }
 
 .qa-messages {
@@ -277,6 +237,8 @@ select {
   padding: 9px 16px;
   font: inherit;
   font-size: 0.9rem;
+  background: var(--bg);
+  color: var(--ink);
   outline: none;
   transition: border-color 0.15s;
 }

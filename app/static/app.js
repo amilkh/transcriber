@@ -6,24 +6,6 @@ const targetLangSelect = document.getElementById("targetLang");
 const qaMessages      = document.getElementById("qa-messages");
 const qaInput         = document.getElementById("qa-input");
 const qaSend          = document.getElementById("qa-send");
-const themeToggle     = document.getElementById("themeToggle");
-
-// ---------------------------------------------------------------------------
-// Dark / light theme toggle
-// ---------------------------------------------------------------------------
-
-function applyTheme(dark) {
-  document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
-  themeToggle.textContent = dark ? "Light" : "Dark";
-  localStorage.setItem("theme", dark ? "dark" : "light");
-}
-
-const savedTheme = localStorage.getItem("theme");
-applyTheme(savedTheme !== "light");  // dark by default
-
-themeToggle.addEventListener("click", () => {
-  applyTheme(document.documentElement.getAttribute("data-theme") !== "dark");
-});
 
 // ?view  → read-only viewer (students / professor)
 const isViewer = new URLSearchParams(location.search).has("view");
@@ -166,9 +148,17 @@ function addFinalEntry(text, detectedLang) {
         enEl.textContent += dec.decode(value, { stream: true });
         transcript.scrollTop = transcript.scrollHeight;
       }
-      if (!enEl.textContent.trim()) enEl.remove();
+      const result = stripTranslationNotes(enEl.textContent);
+      if (!result) { enEl.remove(); return; }
+      enEl.textContent = result;
     } catch (_) { enEl.remove(); }
   })();
+}
+
+// Strip LLM footnotes/notes that sometimes follow the actual translation
+function stripTranslationNotes(text) {
+  // Remove anything after "Note:", "(Note", "\nNote", etc.
+  return text.replace(/\s*[\(\[]?[Nn]ote[:\s\)].*/s, "").trim();
 }
 
 function looksJapanese(text) {
