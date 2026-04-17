@@ -6,6 +6,24 @@ const targetLangSelect = document.getElementById("targetLang");
 const qaMessages      = document.getElementById("qa-messages");
 const qaInput         = document.getElementById("qa-input");
 const qaSend          = document.getElementById("qa-send");
+const themeToggle     = document.getElementById("themeToggle");
+
+// ---------------------------------------------------------------------------
+// Dark / light theme toggle
+// ---------------------------------------------------------------------------
+
+function applyTheme(dark) {
+  document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+  themeToggle.textContent = dark ? "Light" : "Dark";
+  localStorage.setItem("theme", dark ? "dark" : "light");
+}
+
+const savedTheme = localStorage.getItem("theme");
+applyTheme(savedTheme !== "light");  // dark by default
+
+themeToggle.addEventListener("click", () => {
+  applyTheme(document.documentElement.getAttribute("data-theme") !== "dark");
+});
 
 // ?view  → read-only viewer (students / professor)
 const isViewer = new URLSearchParams(location.search).has("view");
