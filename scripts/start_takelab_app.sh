@@ -13,6 +13,20 @@
 #   https://10.10.5.59:8443  (phone — accept cert warning once)
 set -euo pipefail
 
+echo "[0/3] Unloading any stray Ollama models from GPU memory..."
+ssh takelab 'curl -s http://127.0.0.1:11434/api/tags 2>/dev/null | python3 -c "
+import json, sys, urllib.request
+models = json.load(sys.stdin).get(\"models\", [])
+for m in models:
+    name = m[\"name\"]
+    if name != \"qwen2.5:14b\":
+        req = urllib.request.Request(\"http://127.0.0.1:11434/api/generate\",
+            data=json.dumps({\"model\": name, \"keep_alive\": 0}).encode(),
+            method=\"POST\")
+        urllib.request.urlopen(req, timeout=10).read()
+        print(f\"Unloaded {name}\")
+" 2>/dev/null || true'
+
 echo "[1/3] Starting Whisper large-v3 (CUDA) transcriber on takelab..."
 ssh takelab 'fuser -k 19001/tcp 2>/dev/null; true'
 ssh takelab 'cd ~/remote-transcriber && source .venv/bin/activate &&

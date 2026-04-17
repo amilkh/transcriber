@@ -244,6 +244,9 @@ _HALLUCINATIONS: set[str] = {
     "このようなモデルを使用することができます",
     "このようなモデルを使用することができます。",
     "モデルパーティー数分間",
+    "このプログラムは、やり方を読んでいただきたいと思います",
+    "このプログラムは、やり方を読んでいただきたいと思います。",
+    "やり方を読んでいただきたいと思います",
     "おはようございます",
     "おはようございます。",
     "こんにちは",
@@ -265,13 +268,27 @@ def _is_hallucination(text: str) -> bool:
 
 def _is_repetitive_loop(text: str) -> bool:
     """Detect Whisper looping: same short phrase repeated many times."""
-    # Split on common Japanese/English delimiters
-    parts = [p.strip() for p in text.replace("、", ",").replace("。", ",").split(",") if p.strip()]
-    if len(parts) < 4:
+    if not text:
         return False
-    unique = set(parts)
-    # If fewer than 30% of segments are unique, it's a loop
-    return len(unique) / len(parts) < 0.3
+
+    # Check 1: delimiter-based (comma/period-separated segments)
+    parts = [p.strip() for p in text.replace("、", ",").replace("。", ",").split(",") if p.strip()]
+    if len(parts) >= 4 and len(set(parts)) / len(parts) < 0.3:
+        return True
+
+    # Check 2: raw consecutive repetition without delimiters (e.g. 大学院大学院大学院…)
+    n = len(text)
+    for unit_len in range(2, min(14, n // 4 + 1)):
+        unit = text[:unit_len]
+        count = 0
+        pos = 0
+        while pos + unit_len <= n and text[pos:pos + unit_len] == unit:
+            count += 1
+            pos += unit_len
+        if count >= 4 and count * unit_len >= n * 0.6:
+            return True
+
+    return False
 
 
 def _chunk_rms(data: bytes) -> float:
