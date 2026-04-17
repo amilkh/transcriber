@@ -95,6 +95,8 @@ function updatePartial(text) {
     partialEl.className = "partial";
     transcript.appendChild(partialEl);
   }
+  // Never go backwards — only update if new text is longer or similar length
+  if (partialEl.textContent && text.length < partialEl.textContent.length * 0.75) return;
   partialEl.textContent = text;
   transcript.scrollTop = transcript.scrollHeight;
 }

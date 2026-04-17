@@ -171,6 +171,7 @@ _HALLUCINATIONS: set[str] = {
     "コンプリート",
     "このようなモデルを使用することができます",
     "このようなモデルを使用することができます。",
+    "モデルパーティー数分間",
     "Thank you for watching.",
     "Thank you for watching",
     "Please subscribe.",
@@ -202,20 +203,32 @@ def _chunk_rms(data: bytes) -> float:
     return float(np.sqrt(np.mean(samples ** 2))) / 32768.0
 
 
+PARTIAL_TIMEOUT = float(os.getenv("PARTIAL_TIMEOUT", "3.0"))  # commit partial as final after this many seconds unchanged
+
+
 async def ws_transcribe_whisper(ws: WebSocket) -> None:
     await ws.accept()
-    pcm          = bytearray()
-    language     = "auto"
-    last_sent    = ""
-    last_lang    = "ja"
-    silent_count = 0   # consecutive silent 200-ms chunks
-    stop_event   = asyncio.Event()
+    pcm              = bytearray()
+    language         = "auto"
+    last_sent        = ""
+    last_lang        = "ja"
+    silent_count     = 0      # consecutive silent 200-ms chunks
+    last_sent_time   = 0.0    # when last_sent was last updated
+    stop_event       = asyncio.Event()
 
     async def transcribe_loop() -> None:
-        nonlocal last_sent, last_lang
+        nonlocal last_sent, last_lang, last_sent_time
         while not stop_event.is_set():
             await asyncio.sleep(TRANSCRIBE_INTERVAL)
             if len(pcm) // 2 < MIN_SAMPLES:
+                continue
+
+            # Time-based fallback: if partial hasn't changed for PARTIAL_TIMEOUT seconds, commit it
+            if last_sent and (asyncio.get_event_loop().time() - last_sent_time) >= PARTIAL_TIMEOUT:
+                await ws.send_text(json.dumps({"type": "final", "text": last_sent, "lang": last_lang}))
+                del pcm[:]
+                last_sent = ""
+                silent_count = 0
                 continue
 
             start_byte = max(0, len(pcm) - WINDOW_SAMPLES * 2)
@@ -252,6 +265,7 @@ async def ws_transcribe_whisper(ws: WebSocket) -> None:
             if text and text != last_sent and not _is_hallucination(text) and not _is_repetitive_loop(text):
                 last_sent = text
                 last_lang = info.language
+                last_sent_time = asyncio.get_event_loop().time()
                 await ws.send_text(json.dumps({"type": "partial", "text": text, "lang": info.language}))
 
     task = asyncio.create_task(transcribe_loop())
